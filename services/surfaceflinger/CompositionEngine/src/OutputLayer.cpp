@@ -29,6 +29,7 @@
 #include <cutils/ashmem.h>
 #include <include/private/SkHdrMetadata.h>
 #include <sys/mman.h>
+#include <renderengine/DolbyVision.h>
 #include <ui/FloatRect.h>
 #include <ui/HdrRenderTypeUtils.h>
 #include <cmath>
@@ -645,7 +646,8 @@ void OutputLayer::updateCompositionState(
     // These are evaluated every frame as they can potentially change at any
     // time.
     if (layerFEState->forceClientComposition || !profile.isDataspaceSupported(state.dataspace) ||
-        forceClientComposition) {
+        forceClientComposition || renderengine::dolbyVisionRequiresClientComposition(
+                                          layerFEState->buffer, state.dataspace)) {
         state.forceClientComposition = true;
     }
 }
