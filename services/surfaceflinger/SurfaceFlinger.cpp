@@ -9453,6 +9453,7 @@ void SurfaceFlinger::onLayerFirstRef(Layer* layer) {
 }
 
 void SurfaceFlinger::onLayerDestroyed(Layer* layer) {
+    renderengine::onDolbyVisionLayerDestroyed(layer->getName());
     mNumLayers--;
     mScheduler->deregisterLayer(layer);
     if (mTransactionTracing) {
