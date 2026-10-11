@@ -17,6 +17,7 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include "SkiaRenderEngine.h"
+#include "DolbyRenderer.h"
 
 #include <string_view>
 
@@ -630,22 +631,32 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
     const auto& targetBuffer = parameters.layer.source.buffer.buffer;
     const auto graphicBuffer = targetBuffer ? targetBuffer->getBuffer() : nullptr;
 
-    auto shader = parameters.shader;
-    if (graphicBuffer && parameters.shader) {
-        if (stretchEffect.hasEffect()) {
-            shader = mStretchShaderFactory.createSkShader(shader, stretchEffect);
+    auto applyBufferEffects = [&](sk_sp<SkShader> shader) {
+        if (graphicBuffer && shader) {
+            if (stretchEffect.hasEffect()) {
+                shader = mStretchShaderFactory.createSkShader(shader, stretchEffect);
+            }
+            // Fill outside the buffer bounds when edge extension is requested.
+            const auto& edgeExtensionEffect = parameters.layer.edgeExtensionEffect;
+            if (edgeExtensionEffect.hasEffect()) {
+                shader = mEdgeExtensionShaderFactory.createSkShader(shader, parameters.layer,
+                                                                    parameters.imageBounds);
+            }
         }
-        // The given surface requires to be filled outside of its buffer bounds if the edge
-        // extension is required
-        const auto& edgeExtensionEffect = parameters.layer.edgeExtensionEffect;
-        if (edgeExtensionEffect.hasEffect()) {
-            shader = mEdgeExtensionShaderFactory.createSkShader(shader, parameters.layer,
-                                                                parameters.imageBounds);
-        }
+        return shader;
+    };
+    auto shader = applyBufferEffects(parameters.shader);
+    std::function<sk_sp<SkShader>()> makeDolbyInput;
+    if (parameters.makeDolbyInput) {
+        makeDolbyInput = [&] { return applyBufferEffects(parameters.makeDolbyInput()); };
     }
+    auto dolbyShader = createDolbyVisionShader(makeDolbyInput, parameters.layer, parameters.display,
+                                               parameters.targetFormat, mDolbyVulkan,
+                                               parameters.layerDimmingRatio);
+    if (dolbyShader) shader = dolbyShader;
 
     bool usedAgtm = false;
-    if (graphicBuffer) {
+    if (graphicBuffer && !dolbyShader) {
         if (parameters.layer.luts) {
             shader = mLutShader.lutShader(shader, parameters.layer.luts,
                                           parameters.layer.sourceDataspace);
@@ -662,7 +673,7 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         }
     }
 
-    if (parameters.requiresLinearEffect) {
+    if (parameters.requiresLinearEffect && !dolbyShader) {
         const auto format = targetBuffer != nullptr
                 ? std::optional<ui::PixelFormat>(
                           static_cast<ui::PixelFormat>(targetBuffer->getPixelFormat()))
@@ -1526,6 +1537,22 @@ void SkiaRenderEngine::drawLayersInternal(
                     .imageBounds = imageBounds,
                     .agtm = agtm,
                     .colorSpaceOptions = colorSpaceOptions,
+                    .targetFormat = static_cast<ui::PixelFormat>(buffer->getPixelFormat()),
+                    .makeDolbyInput = [&]() -> sk_sp<SkShader> {
+                        // Dolby's inverse matrix expects encoded sampler values. Stock tags
+                        // an output-space image (0x38a394) to avoid color conversion. A raw
+                        // shader preserves that input while retaining the hardware YUV CSC.
+                        auto input = image->makeRawShader(SkSamplingOptions(
+                                                                  item.useTextureFiltering
+                                                                          ? SkFilterMode::kLinear
+                                                                          : SkFilterMode::kNearest),
+                                                          &matrix);
+                        if (useIsOpaqueWorkaround && input) {
+                            input = SkShaders::Blend(SkBlendMode::kPlus, input,
+                                                     SkShaders::Color(SkColors::kBlack, nullptr));
+                        }
+                        return input;
+                    },
             }));
 
             // Turn on dithering when dimming beyond this (arbitrary) threshold...

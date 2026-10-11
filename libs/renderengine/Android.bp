@@ -91,6 +91,7 @@ filegroup {
         "skia/GLExtensions.cpp",
         "skia/ShaderCache.cpp",
         "skia/SkiaRenderEngine.cpp",
+        "skia/DolbyRenderer.cpp",
         "skia/RenderDocUtils.cpp",
         "skia/BoxShadowUtils.cpp",
         "skia/SkiaGLRenderEngine.cpp",
@@ -141,6 +142,8 @@ cc_defaults {
     ],
     shared_libs: [
         "libbinder",
+        "libbinder_ndk",
+        "vendor.dolby.dvs-V1-ndk",
         "libcrypto",
     ],
 }
