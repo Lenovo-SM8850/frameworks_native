@@ -50,6 +50,7 @@
 #pragma clang diagnostic ignored "-Wconversion"
 
 #include <renderengine/DisplaySettings.h>
+#include <renderengine/DolbyVision.h>
 #include <renderengine/RenderEngine.h>
 
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
@@ -1428,6 +1429,8 @@ std::optional<base::unique_fd> Output::composeSurfaces(
 
     renderengine::DisplaySettings clientCompositionDisplay =
             generateClientCompositionDisplaySettings(tex);
+    clientCompositionDisplay.dolbyVisionRenderGeneration =
+            renderengine::getDolbyVisionRenderGeneration();
 
     // Generate the client composition requests for the layers on this output.
     auto& renderEngine = getCompositionEngine().getRenderEngine();

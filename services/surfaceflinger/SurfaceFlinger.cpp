@@ -87,6 +87,7 @@
 #include <private/gui/SyncFeatures.h>
 #include <processgroup/processgroup.h>
 #include <renderengine/RenderEngine.h>
+#include <renderengine/DolbyVision.h>
 #include <renderengine/impl/ExternalTexture.h>
 #include <scheduler/FrameTargeter.h>
 #include <statslog_surfaceflinger_bootstrap.h>
@@ -983,6 +984,25 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
                                            : renderengine::RenderEngine::ContextPriority::Medium);
     chooseRenderEngineType(builder);
     mRenderEngine = renderengine::RenderEngine::create(builder.build());
+    renderengine::setDolbyVisionRepaintCallback([weak = wp<SurfaceFlinger>(sp<SurfaceFlinger>::fromExisting(this))] {
+        if (auto flinger = weak.promote()) {
+            static_cast<void>(flinger->mScheduler->schedule([weak] {
+                if (auto sf = weak.promote()) {
+                    // A paused producer has no new damage. Invalidate both the
+                    // output and the cached client target when its LUT changes.
+                    {
+                        Mutex::Autolock lock(sf->mStateLock);
+                        for (const auto& [token, device] : sf->mDisplays) {
+                            auto display = device->getCompositionDisplay();
+                            auto& state = display->editState();
+                            state.dirtyRegion.set(state.layerStackSpace.getContent());
+                        }
+                    }
+                    sf->scheduleRepaint();
+                }
+            }));
+        }
+    });
     mCompositionEngine->setRenderEngine(mRenderEngine.get());
     mOffloadedCompositionEngine->setRenderEngine(mRenderEngine.get());
     mMaxRenderTargetSize =

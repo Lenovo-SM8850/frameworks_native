@@ -107,10 +107,14 @@ struct DisplaySettings {
 
     // For now, meaningful primarily when the TonemappingStrategy is Local
     float targetHdrSdrRatio = 1.f;
+
+    // Async Dolby transforms can change without a new producer buffer.
+    uint64_t dolbyVisionRenderGeneration = 0;
 };
 
 static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings& rhs) {
-    return lhs.namePlusId == rhs.namePlusId && lhs.physicalDisplay == rhs.physicalDisplay &&
+    return lhs.dolbyVisionRenderGeneration == rhs.dolbyVisionRenderGeneration &&
+            lhs.namePlusId == rhs.namePlusId && lhs.physicalDisplay == rhs.physicalDisplay &&
             lhs.clip == rhs.clip && lhs.maxLuminance == rhs.maxLuminance &&
             lhs.currentLuminanceNits == rhs.currentLuminanceNits &&
             lhs.outputDataspace == rhs.outputDataspace &&

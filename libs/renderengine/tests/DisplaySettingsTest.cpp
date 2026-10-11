@@ -66,4 +66,12 @@ TEST(DisplaySettingsTest, renderIntent) {
 
     ASSERT_FALSE(a == b);
 }
+TEST(DisplaySettingsTest, dolbyVisionTransformInvalidatesCachedComposition) {
+    DisplaySettings pending, ready;
+    ASSERT_EQ(pending, ready);
+    ++ready.dolbyVisionRenderGeneration;
+    EXPECT_FALSE(pending == ready);
+    pending.dolbyVisionRenderGeneration = ready.dolbyVisionRenderGeneration;
+    EXPECT_EQ(pending, ready);
+}
 } // namespace android::renderengine
