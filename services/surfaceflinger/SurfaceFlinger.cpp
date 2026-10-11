@@ -87,6 +87,7 @@
 #include <private/gui/SyncFeatures.h>
 #include <processgroup/processgroup.h>
 #include <renderengine/RenderEngine.h>
+#include <renderengine/DolbyVision.h>
 #include <renderengine/impl/ExternalTexture.h>
 #include <scheduler/FrameTargeter.h>
 #include <statslog_surfaceflinger_bootstrap.h>
@@ -9368,6 +9369,7 @@ void SurfaceFlinger::onLayerFirstRef(Layer* layer) {
 }
 
 void SurfaceFlinger::onLayerDestroyed(Layer* layer) {
+    renderengine::onDolbyVisionLayerDestroyed(layer->getName());
     mNumLayers--;
     mScheduler->deregisterLayer(layer);
     if (mTransactionTracing) {

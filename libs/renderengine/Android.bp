@@ -91,6 +91,7 @@ filegroup {
         "skia/GLExtensions.cpp",
         "skia/ShaderCache.cpp",
         "skia/SkiaRenderEngine.cpp",
+        "skia/DolbyRenderer.cpp",
         "skia/RenderDocUtils.cpp",
         "skia/BoxShadowUtils.cpp",
         "skia/SkiaGLRenderEngine.cpp",
@@ -142,8 +143,12 @@ cc_defaults {
     ],
     shared_libs: [
         "libbinder",
+        "libbinder_ndk",
         "libcrypto",
-    ],
+    ] + select((soong_config_variable("renderengine", "dvs_adapter"), arch()), {
+        (true, "arm64"): ["vendor.dolby.dvs-V1-ndk"],
+        (default, default): [],
+    }),
 }
 
 // Note: if compilation fails when adding librenderengine as a dependency, try adding
@@ -158,7 +163,10 @@ cc_library_static {
         "-fvisibility=hidden",
         "-Werror=format",
         "-Wno-unused-parameter",
-    ],
+    ] + select(soong_config_variable("renderengine", "dvs_adapter"), {
+        true: ["-DRENDERENGINE_DVS_ADAPTER"],
+        default: [],
+    }),
     srcs: [
         ":librenderengine_sources",
         ":librenderengine_threaded_sources",

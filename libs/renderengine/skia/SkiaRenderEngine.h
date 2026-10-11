@@ -33,6 +33,7 @@
 #include <renderengine/RenderEngine.h>
 #include <sys/types.h>
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -96,6 +97,7 @@ public:
     void ensureContextsCreated();
 
 protected:
+    void setDolbyVulkan() { mDolbyVulkan = true; }
 #ifdef MTK_IN_DISPLAY_FINGERPRINT
     SkiaDitherEffect * mSkiaDitherEffect = nullptr;
 #endif
@@ -224,6 +226,8 @@ private:
         const SkRect& imageBounds;
         std::optional<skhdr::AdaptiveGlobalToneMap> agtm;
         ftl::Flags<ColorSpaceOptions> colorSpaceOptions;
+        ui::PixelFormat targetFormat = ui::PixelFormat::RGBA_8888;
+        std::function<sk_sp<SkShader>()> makeDolbyInput = {};
     };
     sk_sp<SkShader> createRuntimeEffectShader(const RuntimeEffectShaderParameters&);
 
@@ -250,6 +254,8 @@ private:
     LutShader mLutShader = LutShader(mRuntimeEffectManager);
     MouriMap mLocalTonemapper = MouriMap(mRuntimeEffectManager);
     StretchShaderFactory mStretchShaderFactory = StretchShaderFactory(mRuntimeEffectManager);
+
+    bool mDolbyVulkan = false;
 
     sp<Fence> mLastDrawFence;
     BlurFilter* mBlurFilter = nullptr;
