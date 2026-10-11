@@ -1,0 +1,713 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "DolbyRenderer.h"
+
+#include <renderengine/DolbyVision.h>
+#include <atomic>
+#include <mutex>
+
+namespace android::renderengine {
+namespace {
+std::mutex repaintMutex;
+std::function<void()> repaintCallback;
+std::atomic<uint64_t> renderGeneration = 0;
+
+[[maybe_unused]] void requestRepaint() {
+    renderGeneration.fetch_add(1);
+    std::function<void()> callback;
+    {
+        std::lock_guard lock(repaintMutex);
+        callback = repaintCallback;
+    }
+    if (callback) callback();
+}
+} // namespace
+
+void setDolbyVisionRepaintCallback(std::function<void()> callback) {
+    std::lock_guard lock(repaintMutex);
+    repaintCallback = std::move(callback);
+}
+
+uint64_t getDolbyVisionRenderGeneration() {
+    return renderGeneration.load();
+}
+} // namespace android::renderengine
+
+#if defined(RENDERENGINE_DVS_ADAPTER) && defined(__aarch64__)
+
+#include <aidl/vendor/dolby/dvs/BnDvsCallback.h>
+#include <aidl/vendor/dolby/dvs/IDvs.h>
+#include <android/binder_ibinder.h>
+#include <android/binder_manager.h>
+#include <dlfcn.h>
+#include <log/log.h>
+#include <renderengine/ColorSpaces.h>
+#include <renderengine/DolbyVision.h>
+#include <renderengine/ExternalTexture.h>
+
+#include <include/core/SkBitmap.h>
+#include <include/core/SkColorSpace.h>
+#include <include/core/SkImage.h>
+#include <include/core/SkShader.h>
+#include <include/effects/SkRuntimeEffect.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+namespace android::renderengine {
+namespace {
+
+using Metadata = std::optional<std::vector<uint8_t>>;
+using Uniform = std::pair<std::string, std::vector<uint8_t>>;
+using Uniforms = std::vector<Uniform>;
+using aidl::vendor::dolby::dvs::IDvs;
+constexpr size_t kMaxPayload = 42 * 1024;
+constexpr std::array<uint8_t, 7> kVideoTag = {0, 0, 0, 1, 0x7c, 1, 0x19};
+constexpr std::array<uint8_t, 7> kAlternateTag = {5, 0x20, 0xb6, 1, 0x32, 0x7d, 2};
+
+// Mobile_3.5.1.93b5ab28 arm64 ABI of the Dolby system libraries.
+// Color metadata is copied as two 16-byte loads; uniform entries have stride 48.
+// The mapper facade contains exactly one pointer to its allocated implementation.
+struct ColorMetadata {
+    uint32_t primaries = 1;
+    uint32_t range = 255;
+    uint32_t transfer = 1;
+    uint32_t reserved = 0;
+    float maxLuminance = 0;
+    std::array<uint32_t, 3> padding = {};
+};
+static_assert(sizeof(ColorMetadata) == 32);
+static_assert(sizeof(Uniform) == 48);
+static_assert(sizeof(Metadata) == 32);
+static_assert(sizeof(void*) == 8);
+
+ColorMetadata colorMetadata(ui::Dataspace dataspace, float luminance, bool source) {
+    ColorMetadata value;
+    const uint32_t bits = static_cast<uint32_t>(dataspace);
+    const uint32_t standard = (bits & HAL_DATASPACE_STANDARD_MASK) >> HAL_DATASPACE_STANDARD_SHIFT;
+    constexpr uint32_t primaries[] = {9, 9, 1, 1, 12};
+    if (standard >= 6 && standard <= 10) value.primaries = primaries[standard - 6];
+    const uint32_t transfer = (bits & HAL_DATASPACE_TRANSFER_MASK) >> HAL_DATASPACE_TRANSFER_SHIFT;
+    constexpr uint32_t sourceTransfers[] = {6, 4, 3, 5, 16, 18};
+    constexpr uint32_t targetTransfers[] = {8, 1, 6, 4, 3, 5, 16, 18};
+    if (source && transfer >= 3 && transfer <= 8) {
+        value.transfer = sourceTransfers[transfer - 3];
+    } else if (!source && transfer >= 1 && transfer <= 8) {
+        value.transfer = targetTransfers[transfer - 1];
+    }
+    switch (bits & HAL_DATASPACE_RANGE_MASK) {
+        case HAL_DATASPACE_RANGE_FULL:
+            value.range = 1;
+            break;
+        case HAL_DATASPACE_RANGE_LIMITED:
+            value.range = 0;
+            break;
+        case HAL_DATASPACE_RANGE_EXTENDED:
+            value.range = 2;
+            break;
+    }
+    value.maxLuminance = luminance;
+    return value;
+}
+
+// The proprietary interface does not publish CFI type information for our
+// reconstructed C++ declarations. Confine the ABI boundary to these calls;
+// do not disable CFI for RenderEngine or SurfaceFlinger as a whole.
+template <size_t Slot, typename Return, typename... Args>
+__attribute__((noinline, no_sanitize("cfi"))) Return effectCall(void* object, Args... args) {
+    auto table = *static_cast<void***>(object);
+    return reinterpret_cast<Return (*)(void*, Args...)>(table[Slot])(object, args...);
+}
+
+template <typename Return, typename... Args>
+__attribute__((noinline, no_sanitize("cfi"))) Return blobCall(void* function, Args... args) {
+    return reinterpret_cast<Return (*)(Args...)>(function)(args...);
+}
+
+class DolbyRenderer;
+DolbyRenderer& renderer();
+std::atomic<DolbyRenderer*> existingRenderer = nullptr;
+
+class Callback final : public aidl::vendor::dolby::dvs::BnDvsCallback {
+public:
+    ndk::ScopedAStatus onDolbyVisionPlaybackStart(bool* result) override;
+    ndk::ScopedAStatus onDolbyVisionPlaybackStop(bool* result) override;
+    ndk::ScopedAStatus onDolbyNotification(const std::string& notification) override;
+};
+
+class DolbyRenderer {
+public:
+    DolbyRenderer() {
+        // Process-lifetime worker: no blob loading, service discovery or Binder
+        // transaction runs on the render thread, even on first use.
+        std::thread([this] { controlLoop(); }).detach();
+        std::thread([this] { holdLoop(); }).detach();
+    }
+
+    std::atomic<bool> serviceDied = false;
+    std::atomic<bool> serviceReady = false;
+    std::atomic<uint64_t> epoch = 0;
+
+    // The mapper facade is immutable after release-publication by load(). Its
+    // getters only query the already loaded, in-process gralloc mapper.
+    bool load() {
+        if (mLoadAttempted) return mAvailable.load();
+        mLoadAttempted = true;
+        // Absolute system paths avoid accidentally loading the vendor ABI variants.
+        mUi = dlopen("/system/lib64/libdolbyui.so", RTLD_NOW | RTLD_LOCAL);
+        mProxy = dlopen("/system/lib64/libdolbyproxyandroid.so", RTLD_NOW | RTLD_LOCAL);
+        mEffectLibrary = dlopen("/system/lib64/libdolbyeffect.so", RTLD_NOW | RTLD_LOCAL);
+        if (!mUi || !mProxy || !mEffectLibrary) {
+            ALOGW("DolbyRenderer: system Dolby blobs unavailable; using AOSP rendering: %s",
+                  dlerror());
+            return false;
+        }
+        mMapperCtor = dlsym(mUi, "_ZN11dolbyvision21DVGraphicBufferMapperC1Ev");
+        mGetMetadata = dlsym(mUi,
+                             "_ZN11dolbyvision21DVGraphicBufferMapper22getDolbyVisionMetadataEPK13n"
+                             "ative_handlePNSt3__18optionalINS4_6vectorIhNS4_9allocatorIhEEEEEERb");
+        mGetTimestamp = dlsym(mUi,
+                              "_ZN11dolbyvision21DVGraphicBufferMapper17getVideoTimestampEPK13nativ"
+                              "e_handleRm");
+        mInstantiate = dlsym(mEffectLibrary, "_ZN11dolbyVision11DolbyEffect11instantiateEv");
+        if (!mMapperCtor || !mGetMetadata || !mGetTimestamp || !mInstantiate) {
+            ALOGW("DolbyRenderer: incompatible system Dolby API; using AOSP rendering");
+            return false;
+        }
+        blobCall<void>(mMapperCtor, &mMapper);
+        mAvailable.store(true, std::memory_order_release);
+        ALOGI("DolbyRenderer: system Dolby Vision renderer available");
+        return true;
+    }
+
+    std::optional<std::vector<uint8_t>> read(const sp<GraphicBuffer>& buffer) {
+        if (!buffer || !mAvailable.load(std::memory_order_acquire)) return std::nullopt;
+        Metadata metadata;
+        bool custom = false;
+        if (blobCall<int>(mGetMetadata, &mMapper, buffer->handle, &metadata, &custom) != 0 ||
+            !metadata || metadata->empty())
+            return std::nullopt;
+        if (custom) {
+            if (metadata->size() < sizeof(uint64_t)) return std::nullopt;
+            uint64_t size;
+            memcpy(&size, metadata->data(), sizeof(size));
+            if (size > kMaxPayload || size > metadata->size() - sizeof(size)) return std::nullopt;
+            metadata = std::vector<uint8_t>(metadata->begin() + sizeof(size),
+                                            metadata->begin() + sizeof(size) + size);
+        }
+        if (metadata->size() > kMaxPayload) return std::nullopt;
+        return metadata;
+    }
+
+    uint64_t timestamp(const sp<GraphicBuffer>& buffer) {
+        uint64_t value = 0;
+        if (buffer && mAvailable.load(std::memory_order_acquire))
+            blobCall<int>(mGetTimestamp, &mMapper, buffer->handle, &value);
+        return value;
+    }
+
+    void connectService() {
+        if (serviceDied.exchange(false)) {
+            serviceReady.store(false);
+            mService.reset();
+            destroyEffect();
+        }
+        if (mService) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mLastServiceCheck < std::chrono::seconds(1)) return;
+        mLastServiceCheck = now;
+        ndk::SpAIBinder binder(AServiceManager_checkService("vendor.dolby.dvs.IDvs/default"));
+        if (!binder.get()) return;
+        auto service = IDvs::fromBinder(binder);
+        if (!service) return;
+        if (!mCallback) mCallback = ndk::SharedRefBase::make<Callback>();
+        if (!service->registerCallback(mCallback).isOk()) return;
+        if (!mDeathRecipient) {
+            mDeathRecipient = AIBinder_DeathRecipient_new([](void* cookie) {
+                auto& state = *static_cast<DolbyRenderer*>(cookie);
+                {
+                    std::lock_guard lock(state.mQueueMutex);
+                    state.serviceReady.store(false);
+                    state.epoch.fetch_add(1);
+                    state.serviceDied.store(true);
+                }
+                state.mWake.notify_one();
+                // A paused layer has no new buffer to trigger a redraw.
+                requestRepaint();
+            });
+        }
+        if (AIBinder_linkToDeath(binder.get(), mDeathRecipient, this) != STATUS_OK) return;
+        mService = std::move(service);
+        if (!serviceDied.load()) serviceReady.store(true);
+    }
+
+    void destroyEffect() {
+        if (mEffect) effectCall<14, void>(mEffect);
+        mEffect = nullptr;
+        mNames.clear();
+    }
+
+    void removeEffectLayer(const std::string& name) {
+        const auto entry = mNames.find(name);
+        if (entry == mNames.end()) return;
+        const auto id = entry->second;
+        mNames.erase(entry);
+        for (const auto& [otherName, otherId] : mNames) {
+            if (otherId == id) return;
+        }
+        if (mEffect) effectCall<12, void>(mEffect, id);
+        if (mNames.empty()) destroyEffect();
+    }
+
+    struct Request {
+        sp<GraphicBuffer> buffer;
+        std::vector<uint8_t> metadata;
+        std::string name;
+        ColorMetadata source;
+        ColorMetadata target;
+        ui::Dataspace outputDataspace = ui::Dataspace::UNKNOWN;
+        float dimming = 1;
+        float luminance = 0;
+        uint32_t id = 0;
+        bool fp16 = false;
+        bool vulkan = false;
+        uint64_t serial = 0;
+        uint64_t timestamp = 0;
+    };
+    struct Frame {
+        std::vector<uint8_t> metadata;
+        uint64_t timestamp;
+        ColorMetadata source;
+        ColorMetadata target;
+        ui::Dataspace outputDataspace;
+        float dimming;
+        float luminance;
+        uint32_t id;
+        bool fp16;
+        bool vulkan;
+        uint64_t epoch;
+        uint32_t size;
+        sk_sp<SkImage> image;
+        Uniforms uniforms;
+        std::string text;
+
+        bool matches(const Request& request, bool allowToneMappingLag = false) const {
+            return id == request.id && fp16 == request.fp16 && vulkan == request.vulkan &&
+                    outputDataspace == request.outputDataspace &&
+                    (allowToneMappingLag ||
+                     (dimming == request.dimming && luminance == request.luminance)) &&
+                    memcmp(&source, &request.source, sizeof(source)) == 0 &&
+                    memcmp(&target, &request.target, sizeof(target)) == 0;
+        }
+    };
+
+    std::shared_ptr<const Frame> generate(Request& request) {
+        if (!mEffect) {
+            mEffect = blobCall<void*>(mInstantiate);
+            if (!mEffect) return nullptr;
+            effectCall<8, void>(mEffect); // enableInverseMatrixNoDVSKPatch.
+        }
+        effectCall<9, void>(mEffect, uint32_t(request.vulkan ? 1 : 0));
+        const auto id = request.id;
+        effectCall<3, void>(mEffect, &request.source, id);
+        effectCall<2, void>(mEffect, request.metadata.data(), uint32_t(request.metadata.size()),
+                            request.timestamp, id);
+        effectCall<0, void>(mEffect, request.fp16);
+        auto frame = std::make_shared<Frame>();
+        frame->metadata = request.metadata;
+        frame->timestamp = request.timestamp;
+        // Clear this field only after the metadata was submitted.
+        memset(request.metadata.data() + 3, 0, 4);
+        if (!mNames.contains(request.name)) {
+            ALOGI("DolbyRenderer: Adding dolby layer name:%s, layer id:%u", request.name.c_str(),
+                  id);
+        }
+        mNames[request.name] = id;
+        effectCall<4, void>(mEffect, &request.target);
+        effectCall<11, void>(mEffect, request.dimming);
+        effectCall<1, void>(mEffect, request.luminance);
+        uint32_t size = 0;
+        auto pixels = effectCall<5, const uint8_t*>(mEffect, &size, id);
+        if (!pixels || size < 2 || size > 64) return nullptr;
+        auto uniforms = effectCall<7, Uniforms>(mEffect, id);
+        const char* text = effectCall<6, const char*>(mEffect);
+        if (!text || strnlen(text, 64 * 1024) == 64 * 1024) return nullptr;
+        frame->source = request.source;
+        frame->target = request.target;
+        frame->outputDataspace = request.outputDataspace;
+        frame->dimming = request.dimming;
+        frame->luminance = request.luminance;
+        frame->id = request.id;
+        frame->fp16 = request.fp16;
+        frame->vulkan = request.vulkan;
+        frame->epoch = epoch.load();
+        frame->size = size;
+        SkBitmap lut;
+        // Each LUT entry is packed as R | G << 10 | B << 20, which is
+        // RGB_101010x, not RGBA8 or float RGBA.
+        const auto info =
+                SkImageInfo::Make(size * size, size, kRGB_101010x_SkColorType, kOpaque_SkAlphaType,
+                                  toSkColorSpace(request.outputDataspace, ColorSpaceOptions::None));
+        if (!lut.tryAllocPixels(info)) return nullptr;
+        memcpy(lut.getPixels(), pixels, size_t(size) * size * size * 4);
+        lut.setImmutable();
+        frame->image = SkImages::RasterFromBitmap(lut);
+        if (!frame->image) return nullptr;
+        frame->uniforms = std::move(uniforms);
+        frame->text = text;
+        return frame;
+    }
+
+    skia::DolbyShaderResult shader(const std::function<sk_sp<SkShader>()>& makeInput,
+                                   Request request, ui::Dataspace outputDataspace) {
+        using skia::DolbyShaderStatus;
+        std::shared_ptr<const Frame> frame;
+        Request retiredRequest;
+        request.outputDataspace = outputDataspace;
+        bool pending = false;
+        bool enqueue = false;
+        {
+            std::lock_guard lock(mQueueMutex);
+            if (const auto entry = mFrames.find(request.name); entry != mFrames.end())
+                frame = entry->second;
+            const bool compatible = serviceReady.load() && frame &&
+                    frame->epoch == epoch.load() && frame->matches(request, true);
+            const bool matching = compatible && frame->metadata == request.metadata &&
+                    frame->timestamp == request.timestamp;
+            const bool seeked = compatible &&
+                    std::abs(int64_t(request.timestamp - frame->timestamp)) > kSeekGapUs;
+            const auto now = std::chrono::steady_clock::now();
+            if (matching && frame->matches(request)) {
+                mLutWaits.erase(request.name);
+                mHoldExpired.erase(request.name);
+                mFailures.erase(request.name);
+            } else {
+                const auto waiting = mLutWaits.try_emplace(request.name, now).first->second;
+                const bool overdue = now - waiting >= std::chrono::milliseconds(500);
+                if (overdue) mHoldExpired.insert(request.name);
+                // A compatible prior LUT may bridge ordinary frame/tone-map lag.
+                // A cold start, encoding change or seek must never expose raw DV.
+                const bool usable = compatible && !seeked &&
+                        (matching || now - waiting < std::chrono::milliseconds(100));
+                if (!usable) {
+                    frame.reset();
+                    pending = !mHoldExpired.count(request.name) && !mFailures.count(request.name);
+                }
+                request.serial = ++mSerials[request.name];
+                auto& queued = mRequests[request.name];
+                retiredRequest = std::move(queued);
+                queued = std::move(request);
+                enqueue = true;
+            }
+        }
+        if (enqueue) {
+            mWake.notify_one();
+            mHoldWake.notify_one();
+        }
+        if (!frame) {
+            return {pending ? DolbyShaderStatus::Pending : DolbyShaderStatus::Error, nullptr};
+        }
+        // Keep the previous LUT and its uniforms together while dimming or
+        // display luminance catches up. Their tone mapping can lag, but the
+        // source, target encoding, format and backend must still match.
+        std::lock_guard lock(mShaderMutex);
+        auto& runtimeEffect = mRuntimeEffects[frame->fp16];
+        auto& sourceText = mRuntimeTexts[frame->fp16];
+        if (!runtimeEffect || sourceText != frame->text) {
+            auto result = SkRuntimeEffect::MakeForShader(SkString(frame->text.c_str()));
+            if (!result.effect) {
+                ALOGW("DolbyRenderer: SkSL compilation failed: %s", result.errorText.c_str());
+                return {DolbyShaderStatus::Error, nullptr};
+            }
+            runtimeEffect = std::move(result.effect);
+            sourceText = frame->text;
+        }
+        const auto size = frame->size;
+        if (!runtimeEffect->findChild("child") || !runtimeEffect->findChild("lut_cube"))
+            return {DolbyShaderStatus::Error, nullptr};
+        const auto matrix = SkMatrix::Scale(1.f / (size * size), 1.f / size);
+        auto lutShader = frame->image->makeShader(SkSamplingOptions(SkFilterMode::kLinear), &matrix);
+        if (!lutShader) return {DolbyShaderStatus::Error, nullptr};
+        SkRuntimeShaderBuilder builder(runtimeEffect);
+        for (const auto& [name, bytes] : frame->uniforms) {
+            const auto* uniform = runtimeEffect->findUniform(name);
+            if (!uniform) continue;
+            if (uniform->sizeInBytes() != bytes.size()) return {DolbyShaderStatus::Error, nullptr};
+            if (!builder.uniform(name).set(bytes.data(), bytes.size()))
+                return {DolbyShaderStatus::Error, nullptr};
+        }
+        auto input = makeInput();
+        if (!input) return {DolbyShaderStatus::Error, nullptr};
+        builder.child("child") = std::move(input);
+        builder.child("lut_cube") = std::move(lutShader);
+        auto shader = builder.makeShader();
+        const auto status = shader ? DolbyShaderStatus::Ready : DolbyShaderStatus::Error;
+        return {status, std::move(shader)};
+    }
+
+    void removeLayer(const std::string& name) {
+        std::shared_ptr<const Frame> retired;
+        Request retiredRequest;
+        {
+            std::lock_guard lock(mQueueMutex);
+            const auto entry = mSerials.find(name);
+            if (entry == mSerials.end()) return;
+            mSerials.erase(entry);
+            Request removal;
+            removal.name = name;
+            auto& queued = mRequests[name];
+            retiredRequest = std::move(queued);
+            queued = std::move(removal);
+            if (const auto entry = mFrames.find(name); entry != mFrames.end()) {
+                retired = std::move(entry->second);
+                mFrames.erase(entry);
+            }
+            mLutWaits.erase(name);
+            mHoldExpired.erase(name);
+            mFailures.erase(name);
+        }
+        mWake.notify_one();
+    }
+
+private:
+    // Independent of Binder/blob latency: a stalled worker cannot leave a paused
+    // layer black forever. Wake SF once at each layer's hold deadline.
+    void holdLoop() {
+        std::unique_lock lock(mQueueMutex);
+        for (;;) {
+            auto deadline = std::chrono::steady_clock::time_point::max();
+            for (const auto& [name, start] : mLutWaits) {
+                if (!mHoldExpired.count(name))
+                    deadline = std::min(deadline, start + std::chrono::milliseconds(500));
+            }
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                mHoldWake.wait(lock);
+                continue;
+            }
+            if (mHoldWake.wait_until(lock, deadline) != std::cv_status::timeout) continue;
+            const auto now = std::chrono::steady_clock::now();
+            bool expired = false;
+            for (const auto& [name, start] : mLutWaits) {
+                if (now - start >= std::chrono::milliseconds(500))
+                    expired |= mHoldExpired.insert(name).second;
+            }
+            lock.unlock();
+            if (expired) requestRepaint();
+            lock.lock();
+        }
+    }
+
+    void controlLoop() {
+        if (!load()) return;
+        std::map<std::string, Request> requests;
+        for (;;) {
+            std::map<std::string, Request> incoming;
+            {
+                std::unique_lock lock(mQueueMutex);
+                const auto ready = [this] { return !mRequests.empty() || serviceDied.load(); };
+                if (requests.empty()) {
+                    mWake.wait(lock, ready);
+                } else {
+                    mWake.wait_for(lock, std::chrono::milliseconds(250), ready);
+                }
+                incoming.swap(mRequests);
+            }
+            for (auto& [name, request] : incoming)
+                requests.insert_or_assign(name, std::move(request));
+            // No render-needed mutex is held anywhere below, including effect
+            // teardown, which can also call the proprietary Binder proxy.
+            bool hasDolbyBuffer = false;
+            for (const auto& [name, request] : requests) hasDolbyBuffer |= bool(request.buffer);
+            if (serviceDied.load() || hasDolbyBuffer) connectService();
+            for (auto entry = requests.begin(); entry != requests.end();) {
+                auto& [name, request] = *entry;
+                if (!request.buffer) {
+                    removeEffectLayer(name);
+                    entry = requests.erase(entry);
+                    continue;
+                }
+                // Keep the latest request while registration is pending/failed,
+                // so throttled retries do not depend on another rendered frame.
+                if (!serviceReady.load()) {
+                    ++entry;
+                    continue;
+                }
+                bool current;
+                {
+                    std::lock_guard lock(mQueueMutex);
+                    const auto serial = mSerials.find(name);
+                    current = serial != mSerials.end() && serial->second == request.serial;
+                }
+                if (current) {
+                    const auto generation = epoch.load();
+                    auto frame = generate(request);
+                    std::shared_ptr<const Frame> retired;
+                    bool changed = false;
+                    {
+                        std::lock_guard lock(mQueueMutex);
+                        const auto serial = mSerials.find(name);
+                        if (frame && serial != mSerials.end() && serviceReady.load() &&
+                            epoch.load() == generation) {
+                            retired = std::move(mFrames[name]);
+                            mFrames[name] = std::move(frame);
+                            mFailures.erase(name);
+                            changed = true;
+                        } else if (!frame && serial != mSerials.end()) {
+                            changed = mFailures.insert(name).second;
+                        }
+                    }
+                    if (changed) requestRepaint();
+                }
+                entry = requests.erase(entry);
+            }
+        }
+    }
+
+    // Timestamps are in microseconds. Normal frames are at most tens of ms apart.
+    static constexpr int64_t kSeekGapUs = 100'000;
+
+    std::mutex mQueueMutex;
+    std::condition_variable mWake;
+    std::condition_variable mHoldWake;
+    std::unordered_set<std::string> mHoldExpired, mFailures;
+    std::map<std::string, Request> mRequests;
+    std::map<std::string, uint64_t> mSerials;
+    std::map<std::string, std::shared_ptr<const Frame>> mFrames;
+    std::map<std::string, std::chrono::steady_clock::time_point> mLutWaits;
+    std::mutex mShaderMutex;
+    std::array<std::string, 2> mRuntimeTexts;
+
+    bool mLoadAttempted = false;
+    std::atomic<bool> mAvailable = false;
+    void* mUi = nullptr;
+    void* mProxy = nullptr;
+    void* mEffectLibrary = nullptr;
+    void* mMapper = nullptr;
+    void* mMapperCtor = nullptr;
+    void* mGetMetadata = nullptr;
+    void* mGetTimestamp = nullptr;
+    void* mInstantiate = nullptr;
+    void* mEffect = nullptr;
+    std::map<std::string, uint32_t> mNames;
+    std::array<sk_sp<SkRuntimeEffect>, 2> mRuntimeEffects;
+    std::shared_ptr<IDvs> mService;
+    std::shared_ptr<Callback> mCallback;
+    AIBinder_DeathRecipient* mDeathRecipient = nullptr;
+    std::chrono::steady_clock::time_point mLastServiceCheck;
+};
+
+DolbyRenderer& renderer() {
+    // The mapper, Binder callbacks and dlopen handles share process lifetime.
+    // No callback can outlive this object during SurfaceFlinger teardown.
+    static auto* instance = new DolbyRenderer;
+    existingRenderer.store(instance, std::memory_order_release);
+    return *instance;
+}
+
+// Playback notifications describe producer activity, but its last Dolby
+// buffer can remain visible. Layer removal and service death own teardown.
+ndk::ScopedAStatus Callback::onDolbyVisionPlaybackStart(bool* result) {
+    *result = true;
+    return ndk::ScopedAStatus::ok();
+}
+ndk::ScopedAStatus Callback::onDolbyVisionPlaybackStop(bool* result) {
+    *result = true;
+    return ndk::ScopedAStatus::ok();
+}
+ndk::ScopedAStatus Callback::onDolbyNotification(const std::string&) {
+    return ndk::ScopedAStatus::ok();
+}
+} // namespace
+
+bool dolbyVisionRequiresClientComposition(const sp<GraphicBuffer>& buffer,
+                                          ui::Dataspace dataspace) {
+    const auto transfer = static_cast<uint32_t>(dataspace) & HAL_DATASPACE_TRANSFER_MASK;
+    if (transfer != HAL_DATASPACE_TRANSFER_ST2084 && transfer != HAL_DATASPACE_TRANSFER_HLG)
+        return false;
+    auto& state = renderer();
+    auto metadata = state.read(buffer);
+    constexpr char kMobile[] = "mobile";
+    if (!metadata || metadata->size() < 16 ||
+        memcmp(metadata->data(), kVideoTag.data(), kVideoTag.size()) != 0 ||
+        memcmp(metadata->data() + 7, kMobile, 6) != 0)
+        return false;
+    const size_t offset = (*metadata)[13] | (size_t((*metadata)[14]) << 8);
+    return offset + 8 < metadata->size() && (*metadata)[offset + 8] == 0;
+}
+
+void onDolbyVisionLayerDestroyed(const std::string& name) {
+    if (auto* state = existingRenderer.load(std::memory_order_acquire)) state->removeLayer(name);
+}
+
+namespace skia {
+DolbyShaderResult createDolbyVisionShader(const std::function<sk_sp<SkShader>()>& makeInput,
+                                        const LayerSettings& layer, const DisplaySettings& display,
+                                        ui::PixelFormat targetFormat, bool vulkan,
+                                        float dimmingRatio) {
+    if (!makeInput || !layer.source.buffer.buffer) return {};
+    // Dolby accepts one RGB dimming scalar; preserve AOSP's full matrix path
+    // for channel mixing, translation, alpha changes or amplification.
+    const float scalar = layer.colorTransform[0][0];
+    auto& state = renderer();
+    auto buffer = layer.source.buffer.buffer->getBuffer();
+    auto metadata = state.read(buffer);
+    if (!metadata || metadata->size() < kVideoTag.size()) return {};
+    const uint32_t id = memcmp(metadata->data(), kVideoTag.data(), kVideoTag.size()) == 0 ? 1
+            : memcmp(metadata->data(), kAlternateTag.data(), kAlternateTag.size()) == 0   ? 2
+                                                                                          : 0;
+    // Non-Dolby buffers never enqueue control work or touch DVS / effect state.
+    if (!id) return {};
+    if (!std::isfinite(scalar) || scalar < 0 || scalar > 1 ||
+        layer.colorTransform != mat4::scale(vec4(scalar, scalar, scalar, 1)))
+        return {DolbyShaderStatus::Error, nullptr};
+    DolbyRenderer::Request request;
+    // Capture metadata and its timestamp together before the producer can
+    // recycle this buffer while control work is pending. This is local gralloc.
+    request.timestamp = state.timestamp(buffer);
+    request.buffer = std::move(buffer);
+    request.metadata = std::move(*metadata);
+    request.name = layer.name;
+    request.source =
+            colorMetadata(layer.sourceDataspace, layer.source.buffer.maxLuminanceNits, true);
+    request.target = colorMetadata(display.outputDataspace, 0, false);
+    request.dimming = scalar * dimmingRatio;
+    request.luminance = display.currentLuminanceNits;
+    request.id = id;
+    request.fp16 = targetFormat == ui::PixelFormat::RGBA_FP16;
+    request.vulkan = vulkan;
+    return state.shader(makeInput, std::move(request), display.outputDataspace);
+}
+} // namespace skia
+} // namespace android::renderengine
+#else
+
+#include <include/core/SkShader.h>
+#include <renderengine/DolbyVision.h>
+
+namespace android::renderengine {
+bool dolbyVisionRequiresClientComposition(const sp<GraphicBuffer>&, ui::Dataspace) {
+    return false;
+}
+
+void onDolbyVisionLayerDestroyed(const std::string&) {}
+
+namespace skia {
+DolbyShaderResult createDolbyVisionShader(const std::function<sk_sp<SkShader>()>&,
+                                      const LayerSettings&, const DisplaySettings&,
+                                      ui::PixelFormat, bool, float) {
+    return {};
+}
+} // namespace skia
+} // namespace android::renderengine
+#endif
