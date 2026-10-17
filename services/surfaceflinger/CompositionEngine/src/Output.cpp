@@ -1669,9 +1669,9 @@ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
                         hasSmpte2094_50 = err == OK && smpte2094_50;
                     }
 
-                    if (!hasSmpte2094_50 && layer->getState().hwc) {
-                        luts = layer->getState().hwc->luts;
-                    }
+                    // Composer LUTs map HDR to the panel peak for device composition. Client
+                    // composition tone-maps HDR to the current display luminance instead.
+                    (void)hasSmpte2094_50;
                 }
                 compositionengine::LayerFE::ClientCompositionTargetSettings
                         targetSettings{.clip = clip,
