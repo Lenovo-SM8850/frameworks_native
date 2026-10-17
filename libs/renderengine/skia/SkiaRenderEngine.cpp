@@ -731,10 +731,24 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
             colorTransform *= mat4::scale(vec4(scale, scale, scale, 1.f));
         }
 
+        float maxDisplayLuminance = parameters.display.maxLuminance;
+        const auto inputTransfer = inputDataspace & HAL_DATASPACE_TRANSFER_MASK;
+        const auto outputTransfer = parameters.outputDataSpace & HAL_DATASPACE_TRANSFER_MASK;
+        if (parameters.display.tonemapStrategy == DisplaySettings::TonemapStrategy::Libtonemap &&
+            inputTransfer == HAL_DATASPACE_TRANSFER_ST2084 &&
+            outputTransfer != HAL_DATASPACE_TRANSFER_ST2084 &&
+            outputTransfer != HAL_DATASPACE_TRANSFER_HLG &&
+            parameters.display.currentLuminanceNits > 0.f) {
+            // Normalize fallback PQ-to-SDR mapping to the current display luminance, so the HDR
+            // capability peak does not darken reference white below the display's actual peak.
+            maxDisplayLuminance =
+                    std::min(maxDisplayLuminance, parameters.display.currentLuminanceNits);
+        }
+
         const auto hardwareBuffer = graphicBuffer ? graphicBuffer->toAHardwareBuffer() : nullptr;
         shader = RuntimeEffectManager::createLinearEffectShader(shader, effect, runtimeEffect,
                                                                 std::move(colorTransform),
-                                                                parameters.display.maxLuminance,
+                                                                maxDisplayLuminance,
                                                                 parameters.display
                                                                         .currentLuminanceNits,
                                                                 parameters.layer.source.buffer
