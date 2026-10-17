@@ -1659,7 +1659,7 @@ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
                     luts = layerFEState->luts;
                 } else if (layerState.generatedLuts) {
                     luts = layerState.generatedLuts;
-                } else {
+                } else if (!base::GetBoolProperty("ro.surface_flinger.bypass_composer_luts", false)) {
                     bool hasSmpte2094_50 = false;
 
                     if (FlagManager::getInstance().force_agtm_without_luts() &&
