@@ -2459,8 +2459,7 @@ status_t SurfaceFlinger::setDisplayBrightness(const sp<IBinder>& displayToken,
                                                              .applyImmediately = true});
                    }
                } else {
-                   SFTRACE_FORMAT("%s (invalid display token) %s", whence,
-                                  to_string(display->getId()).c_str(),
+                   SFTRACE_FORMAT("%s (invalid display token %p) %s", whence, displayToken.get(),
                                   brightness.toString().c_str());
                    ALOGE("%s: Invalid display token %p", whence, displayToken.get());
                    return ftl::yield<status_t>(NAME_NOT_FOUND);
