@@ -16,7 +16,9 @@
 
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
+#include <ftl/fake_guard.h>
 #include <algorithm>
+#include <gui/WindowInfo.h>
 
 #include "FpsReporter.h"
 #include "Layer.h"
@@ -29,7 +31,57 @@ FpsReporter::FpsReporter(scheduler::FrameTimeline& frameTimeline, std::unique_pt
     LOG_ALWAYS_FATAL_IF(mClock == nullptr, "Passed in null clock when constructing FpsReporter!");
 }
 
-void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarchy) {
+scheduler::MainLayerSelector::Candidate FpsReporter::selectMainLayer(
+        const frontend::LayerHierarchy& hierarchy, const frontend::LayerSnapshotBuilder& snapshots,
+        int32_t taskId, int32_t uid) {
+    if (uid < 0 && mGameListener && mGameListener->taskId == taskId) uid = mGameListener->uid;
+    if (uid < 0) {
+        // Read the authoritative window metadata even when snapshot metadata
+        // collection is disabled. Task containers themselves are system-owned.
+        double largestWindow = 0;
+        hierarchy.traverse([&](const frontend::LayerHierarchy& node,
+                               const frontend::LayerHierarchy::TraversalPath& path) {
+            if (path.variant == frontend::LayerHierarchy::Variant::Detached) return false;
+            const auto& metadata = node.getLayer()->metadata;
+            if (metadata.has(gui::METADATA_TASK_ID) &&
+                metadata.getInt32(gui::METADATA_TASK_ID, -1) != taskId) return false;
+            if (metadata.getInt32(gui::METADATA_WINDOW_TYPE, -1) !=
+                static_cast<int32_t>(gui::WindowInfo::Type::BASE_APPLICATION)) return true;
+            const auto* snapshot = snapshots.getSnapshot(path);
+            const int32_t owner = metadata.getInt32(gui::METADATA_OWNER_UID, -1);
+            if (!snapshot || snapshot->isHiddenByPolicy() || owner < 0) return true;
+            const auto& bounds = snapshot->transformedBounds;
+            const double area = std::max(0.f, bounds.getWidth()) *
+                    double(std::max(0.f, bounds.getHeight()));
+            if (area > largestWindow) {
+                uid = owner;
+                largestWindow = area;
+            }
+            return true;
+        });
+        if (uid < 0) return {};
+    }
+    std::vector<scheduler::MainLayerSelector::Candidate> candidates;
+    hierarchy.traverse([&](const frontend::LayerHierarchy& node,
+                           const frontend::LayerHierarchy::TraversalPath& path) {
+        if (path.variant == frontend::LayerHierarchy::Variant::Detached) return false;
+        const auto& state = *node.getLayer();
+        if (state.metadata.has(gui::METADATA_TASK_ID) &&
+            state.metadata.getInt32(gui::METADATA_TASK_ID, -1) != taskId) return false;
+        const auto* snapshot = snapshots.getSnapshot(path);
+        if (!snapshot || !snapshot->isVisible || !snapshot->buffer) return true;
+        const auto owner = static_cast<int32_t>(state.ownerUid.val());
+        const auto& bounds = snapshot->transformedBounds;
+        const double area = std::max(0.f, bounds.right - bounds.left) *
+                double(std::max(0.f, bounds.bottom - bounds.top));
+        candidates.push_back({static_cast<int32_t>(state.id), owner, area});
+        return true;
+    });
+    return mMainLayers[taskId].select(candidates, uid);
+}
+
+void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarchy,
+                                  const frontend::LayerSnapshotBuilder& snapshots) {
     const auto now = mClock->now();
     if (now - mLastDispatch < kMinDispatchDuration) {
         return;
@@ -48,6 +100,19 @@ void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarch
                        });
     }
 
+    {
+        std::lock_guard lock(mMutex);
+        for (auto it = mMainLayers.begin(); it != mMainLayers.end();) {
+            const bool tracked = std::any_of(localListeners.begin(), localListeners.end(),
+                                            [&](const auto& listener) {
+                                                return listener.taskId == it->first;
+                                            });
+            if (!tracked && (!mGameListener || mGameListener->taskId != it->first))
+                it = mMainLayers.erase(it);
+            else
+                ++it;
+        }
+    }
     std::unordered_set<int32_t> seenTasks;
     std::vector<std::pair<TrackedListener, const frontend::LayerHierarchy*>>
             listenersAndLayersToReport;
@@ -86,6 +151,18 @@ void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarch
             return true;
         });
 
+        {
+            std::lock_guard lock(mMutex);
+            const auto main = selectMainLayer(*hierarchy, snapshots, listener.taskId);
+            const auto* task = snapshots.getSnapshot(hierarchy->getLayer()->id);
+            if (task) {
+                const auto& bounds = task->transformedBounds;
+                const double taskArea = std::max(0.f, bounds.right - bounds.left) *
+                        double(std::max(0.f, bounds.bottom - bounds.top));
+                if (scheduler::MainLayerSelector::coversTask(main, taskArea))
+                    layerIds = {main.id};
+            }
+        }
         listener.listener->onFpsReported(mFrameTimeline.computeFps(layerIds));
     }
 
@@ -95,6 +172,10 @@ void FpsReporter::dispatchLayerFps(const frontend::LayerHierarchy& layerHierarch
 void FpsReporter::binderDied(const wp<IBinder>& who) {
     std::scoped_lock lock(mMutex);
     mListeners.erase(who);
+    if (mGameListener && wp<IBinder>(IInterface::asBinder(mGameListener->listener)) == who) {
+        mGameListener.reset(); ++mGameGeneration;
+        mFrameTimeline.setGameFrameTracking(false, -1);
+    }
 }
 
 void FpsReporter::addListener(const sp<gui::IFpsListener>& listener, int32_t taskId) {
@@ -107,6 +188,76 @@ void FpsReporter::addListener(const sp<gui::IFpsListener>& listener, int32_t tas
 void FpsReporter::removeListener(const sp<gui::IFpsListener>& listener) {
     std::lock_guard lock(mMutex);
     mListeners.erase(wp<IBinder>(IInterface::asBinder(listener)));
+}
+
+uint64_t FpsReporter::addGameListener(const sp<gui::IGameFrameListener>& listener,
+                                     int32_t taskId, int32_t uid) {
+    std::lock_guard lock(mMutex);
+    if (mGameListener) return 0;
+    auto binder = IInterface::asBinder(listener);
+    if (binder->linkToDeath(sp<DeathRecipient>::fromExisting(this)) != OK) return 0;
+    mGameListener = GameListener{listener, taskId, uid};
+    mGameLogTime = mClock->now();
+    mGameLog = {};
+    mFrameTimeline.setGameFrameTracking(true, uid);
+    return ++mGameGeneration;
+}
+
+void FpsReporter::removeGameListener(const sp<gui::IGameFrameListener>& listener) {
+    std::lock_guard lock(mMutex);
+    if (!mGameListener || IInterface::asBinder(mGameListener->listener) != IInterface::asBinder(listener)) return;
+    IInterface::asBinder(listener)->unlinkToDeath(sp<DeathRecipient>::fromExisting(this));
+    mGameListener.reset(); ++mGameGeneration;
+    mFrameTimeline.setGameFrameTracking(false, -1);
+}
+
+bool FpsReporter::dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy& hierarchy) {
+    sp<gui::IGameFrameListener> listener;
+    scheduler::GameFrameTracker::Report report;
+    {
+        std::lock_guard lock(mMutex);
+        if (!mGameListener || generation != mGameGeneration) return false;
+        const auto tracked = *mGameListener;
+        std::unordered_set<int32_t> layers;
+        hierarchy.traverse([&](const frontend::LayerHierarchy& node,
+                               const frontend::LayerHierarchy::TraversalPath& path) {
+            if (path.variant == frontend::LayerHierarchy::Variant::Detached) return false;
+            const auto& metadata = node.getLayer()->metadata;
+            if (!metadata.has(gui::METADATA_TASK_ID) ||
+                metadata.getInt32(gui::METADATA_TASK_ID, -1) != tracked.taskId) return true;
+            // The traversal runs synchronously under mMutex.
+            const auto main = FTL_FAKE_GUARD(mMutex,
+                    selectMainLayer(node, snapshots, tracked.taskId, tracked.uid));
+            if (main.id >= 0) layers.insert(main.id);
+            return false;
+        });
+        report = mFrameTimeline.computeGameFrameStats(layers, systemTime(SYSTEM_TIME_MONOTONIC));
+        listener = tracked.listener;
+        mGameLog.totalFrames += report.totalFrames;
+        mGameLog.appJankFrames += report.appJankFrames;
+        mGameLog.cadenceJankFrames += report.cadenceJankFrames;
+        mGameLog.classifiedFrames += report.classifiedFrames;
+        mGameLog.cadenceFrames += report.cadenceFrames;
+        const auto now = mClock->now();
+        if (now - mGameLogTime >= std::chrono::seconds(30)) {
+            ALOGI("Game frame feedback layer=%d frames=%d app_jank=%d classified_frames=%d "
+                  "cadence_frames=%d cadence_jank=%d", report.layerId, mGameLog.totalFrames,
+                  mGameLog.appJankFrames, mGameLog.classifiedFrames, mGameLog.cadenceFrames,
+                  mGameLog.cadenceJankFrames);
+            mGameLogTime = now;
+            mGameLog = {};
+        }
+    }
+    gui::GameFrameStats stats;
+    stats.fps = report.fps;
+    stats.appJankFrames = report.appJankFrames; stats.totalFrames = report.totalFrames;
+    stats.windowMs = report.windowMs; stats.layerId = report.layerId;
+    stats.layerChanged = report.layerChanged; stats.stalled = report.stalled;
+    stats.appDeadlineMissed = report.appDeadlineMissed; stats.bufferStuffing = report.bufferStuffing;
+    stats.predictionErrors = report.predictionErrors; stats.compositorJankFrames = report.compositorJankFrames;
+    listener->onFrameReported(stats);
+    std::lock_guard lock(mMutex);
+    return mGameListener && generation == mGameGeneration;
 }
 
 } // namespace android

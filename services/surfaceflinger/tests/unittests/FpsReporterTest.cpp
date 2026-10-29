@@ -126,6 +126,7 @@ LayerCreationArgs FpsReporterTest::createArgs(uint32_t id, bool canBeRoot, uint3
     args.flags = LAYER_FLAGS;
     args.metadata = metadata;
     args.parentId = parentId;
+    args.ownerUid = 10001;
     return args;
 }
 
@@ -167,13 +168,13 @@ TEST_F(FpsReporterTest, callsListeners) {
 
     mFpsReporter->addListener(mFpsListener, kTaskId);
     mClock->advanceTime(600ms);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
     EXPECT_EQ(expectedFps, mFpsListener->lastReportedFps);
     mFpsReporter->removeListener(mFpsListener);
     Mock::VerifyAndClearExpectations(&mFrameTimeline);
 
     EXPECT_CALL(mFrameTimeline, computeFps(_)).Times(0);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
 }
 
 TEST_F(FpsReporterTest, rateLimits) {
@@ -195,17 +196,62 @@ TEST_F(FpsReporterTest, rateLimits) {
 
     mFpsReporter->addListener(mFpsListener, kTaskId);
     mClock->advanceTime(600ms);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
     EXPECT_EQ(firstFps, mFpsListener->lastReportedFps);
     mClock->advanceTime(200ms);
-    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy());
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), frontend::LayerSnapshotBuilder{});
     EXPECT_EQ(secondFps, mFpsListener->lastReportedFps);
+}
+
+TEST_F(FpsReporterTest, MainBufferSelectionAndHudCoverageFallback) {
+    constexpr int32_t kTaskId = 12;
+    LayerMetadata taskMetadata;
+    taskMetadata.setInt32(gui::METADATA_TASK_ID, kTaskId);
+    LayerMetadata windowMetadata;
+    windowMetadata.setInt32(gui::METADATA_OWNER_UID, 10001);
+    windowMetadata.setInt32(gui::METADATA_WINDOW_TYPE,
+                            static_cast<int32_t>(gui::WindowInfo::Type::BASE_APPLICATION));
+    createRootLayer(1, taskMetadata);
+    createLayer(11, 1, windowMetadata);
+    createLayer(111, 11);
+    createLayer(112, 11);
+    frontend::LayerHierarchyBuilder hierarchyBuilder;
+    hierarchyBuilder.update(mLifecycleManager);
+    frontend::LayerSnapshotBuilder::Args args{
+            .root = hierarchyBuilder.getHierarchy(),
+            .layerLifecycleManager = mLifecycleManager,
+            .displays = {},
+            .globalShadowSettings = {},
+            .supportedLayerGenericMetadata = {},
+            .genericLayerMetadataKeyMap = {}};
+    frontend::LayerSnapshotBuilder snapshots(args);
+    snapshots.getSnapshot(1)->transformedBounds = FloatRect(0, 0, 100, 100);
+    snapshots.getSnapshot(11)->transformedBounds = FloatRect(0, 0, 100, 100);
+    for (uint32_t id : {111u, 112u}) {
+        auto* snapshot = snapshots.getSnapshot(id);
+        snapshot->isVisible = true;
+        snapshot->buffer = sp<GraphicBuffer>::make();
+    }
+    snapshots.getSnapshot(111)->transformedBounds = FloatRect(0, 0, 100, 100);
+    snapshots.getSnapshot(112)->transformedBounds = FloatRect(0, 0, 20, 20);
+    mFpsReporter->addListener(mFpsListener, kTaskId);
+    EXPECT_CALL(mFrameTimeline, computeFps(UnorderedElementsAre(111))).WillOnce(Return(60.f));
+    mClock->advanceTime(600ms);
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), snapshots);
+
+    // Hidden/destroyed main surfaces retire immediately. A remaining small
+    // popup does not change the upstream task-FPS contract for non-game callers.
+    snapshots.getSnapshot(111)->isVisible = false;
+    EXPECT_CALL(mFrameTimeline, computeFps(UnorderedElementsAre(1, 11, 111, 112)))
+            .WillOnce(Return(30.f));
+    mClock->advanceTime(600ms);
+    mFpsReporter->dispatchLayerFps(hierarchyBuilder.getHierarchy(), snapshots);
 }
 
 } // namespace

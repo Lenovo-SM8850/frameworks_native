@@ -1998,6 +1998,57 @@ nsecs_t FrameTimeline::DisplayFrame::trace(pid_t surfaceFlingerPid, nsecs_t mono
     return result;
 }
 
+void FrameTimeline::setGameFrameTracking(bool enabled, int32_t uid) {
+    std::scoped_lock lock(mMutex);
+    mGameFrameUid = enabled ? uid : -1;
+    mGameFrameTracking.store(enabled);
+    mGameVisibleLayers.reset();
+    mGameFrames.reset();
+}
+
+void FrameTimeline::setGameFrameVisibleLayers(std::unordered_set<int32_t> layers) {
+    std::scoped_lock lock(mMutex);
+    if (mGameFrameUid < 0) return;
+    // Retain composition-time visibility until this display frame's fence signals.
+    mGameVisibleLayers = layers.empty()
+            ? nullptr : std::make_shared<const std::unordered_set<int32_t>>(std::move(layers));
+    mCurrentDisplayFrame->gameVisibleLayers = mGameVisibleLayers;
+}
+
+GameFrameTracker::Report FrameTimeline::computeGameFrameStats(
+        const std::unordered_set<int32_t>& layers, int64_t now) {
+    std::scoped_lock lock(mMutex);
+    if (mGameFrameUid < 0) return {};
+    // The final present fence may signal after composition stops. The listener's
+    // timer must drain it without waiting for another display frame.
+    flushPendingPresentFences();
+    std::unordered_set<int32_t> visible;
+    if (mGameVisibleLayers) {
+        for (auto layer : layers) if (mGameVisibleLayers->count(layer)) visible.insert(layer);
+    }
+    return mGameFrames.report(visible, now);
+}
+
+void FrameTimeline::recordGameFrames(const DisplayFrame& display) {
+    if (mGameFrameUid < 0) return;
+    const auto present = display.getActuals().presentTime;
+    if (present <= 0) return;
+    constexpr int32_t compositorMask = JankType::DisplayHAL |
+            JankType::SurfaceFlingerCpuDeadlineMissed | JankType::SurfaceFlingerGpuDeadlineMissed |
+            JankType::SurfaceFlingerScheduling | JankType::SurfaceFlingerStuffing;
+    for (const auto& frame : display.getSurfaceFrames()) {
+        if (frame->getOwnerUid() != static_cast<uid_t>(mGameFrameUid) || !frame->getIsBuffer() ||
+            frame->getPresentState() != SurfaceFrame::PresentState::Presented) continue;
+        const auto jank = frame->getJankType().value_or(JankType::None);
+        mGameFrames.add(frame->getLayerId(), present, true, true,
+                        jank & JankType::AppDeadlineMissed, jank & JankType::BufferStuffing,
+                        jank & JankType::PredictionError, jank & compositorMask,
+                        display.gameVisibleLayers &&
+                                display.gameVisibleLayers->count(frame->getLayerId()) > 0,
+                        frame->getPredictionState() != PredictionState::None, display.getVsyncPeriod());
+    }
+}
+
 float FrameTimeline::computeFps(const std::unordered_set<int32_t>& layerIds) {
     if (layerIds.empty()) {
         return 0.0f;
@@ -2131,6 +2182,7 @@ void FrameTimeline::flushPendingPresentFences() {
         auto& displayFrame = pendingPresentFence.second;
         displayFrame->onPresent(signalTime, mPreviousPredictionPresentTime,
                                 mPreviousActualPresentTime);
+        if (mGameFrameUid >= 0 && signalTime > 0) recordGameFrames(*displayFrame);
 
         mPreviousPredictionPresentTime =
                 displayFrame->trace(mSurfaceFlingerPid, monoBootOffset,

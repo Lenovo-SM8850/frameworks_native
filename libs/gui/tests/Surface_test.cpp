@@ -992,6 +992,15 @@ public:
         return binder::Status::ok();
     }
 
+    binder::Status addGameFrameListener(int32_t, int32_t,
+                                        const sp<gui::IGameFrameListener>&) override {
+        return binder::Status::fromStatusT(INVALID_OPERATION);
+    }
+
+    binder::Status removeGameFrameListener(const sp<gui::IGameFrameListener>&) override {
+        return binder::Status::fromStatusT(INVALID_OPERATION);
+    }
+
     binder::Status addTunnelModeEnabledListener(
             const sp<gui::ITunnelModeEnabledListener>& /*listener*/) override {
         return binder::Status::ok();

@@ -18,6 +18,7 @@
 
 #include <android-base/thread_annotations.h>
 #include <android/gui/IFpsListener.h>
+#include <android/gui/IGameFrameListener.h>
 #include <binder/IBinder.h>
 
 #include <unordered_map>
@@ -40,7 +41,8 @@ public:
     // Dispatches updated layer fps values for the registered listeners
     // This method promotes Layer weak pointers and performs layer stack traversals, so mStateLock
     // must be held when calling this method.
-    void dispatchLayerFps(const frontend::LayerHierarchy&) EXCLUDES(mMutex);
+    void dispatchLayerFps(const frontend::LayerHierarchy&,
+                          const frontend::LayerSnapshotBuilder&) EXCLUDES(mMutex);
 
     // Override for IBinder::DeathRecipient
     void binderDied(const wp<IBinder>&) override;
@@ -49,9 +51,17 @@ public:
     void addListener(const sp<gui::IFpsListener>& listener, int32_t taskId);
     // Deregisters an Fps listener
     void removeListener(const sp<gui::IFpsListener>& listener);
+    uint64_t addGameListener(const sp<gui::IGameFrameListener>& listener, int32_t taskId, int32_t uid);
+    void removeGameListener(const sp<gui::IGameFrameListener>& listener);
+    // Called by a 500 ms scheduler task, including when composition is idle.
+    bool dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy&) EXCLUDES(mMutex);
 
 private:
+    scheduler::MainLayerSelector::Candidate selectMainLayer(
+            const frontend::LayerHierarchy&, const frontend::LayerSnapshotBuilder&,
+            int32_t taskId, int32_t uid = -1) REQUIRES(mMutex);
     mutable std::mutex mMutex;
+    std::unordered_map<int32_t, scheduler::MainLayerSelector> mMainLayers GUARDED_BY(mMutex);
 
     struct TrackedListener {
         sp<gui::IFpsListener> listener;
@@ -64,6 +74,14 @@ private:
     std::unique_ptr<Clock> mClock;
     std::chrono::steady_clock::time_point mLastDispatch;
     std::unordered_map<wp<IBinder>, TrackedListener, WpHash> mListeners GUARDED_BY(mMutex);
+    struct GameListener {
+        sp<gui::IGameFrameListener> listener;
+        int32_t taskId, uid;
+    };
+    std::optional<GameListener> mGameListener GUARDED_BY(mMutex);
+    uint64_t mGameGeneration GUARDED_BY(mMutex) = 0;
+    std::chrono::steady_clock::time_point mGameLogTime GUARDED_BY(mMutex);
+    scheduler::GameFrameTracker::Report mGameLog GUARDED_BY(mMutex);
 };
 
 } // namespace android
