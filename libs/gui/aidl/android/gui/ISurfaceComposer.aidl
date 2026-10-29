@@ -38,6 +38,7 @@ import android.gui.HdrConversionStrategy;
 import android.gui.IActivePictureListener;
 import android.gui.IDisplayEventConnection;
 import android.gui.IFpsListener;
+import android.gui.IGameFrameListener;
 import android.gui.IHdrLayerInfoListener;
 import android.gui.IRegionSamplingListener;
 import android.gui.IScreenCaptureListener;
@@ -405,6 +406,7 @@ interface ISurfaceComposer {
      */
     void removeFpsListener(IFpsListener listener);
 
+
     /**
      * Registers a listener to receive tunnel mode enabled updates from SurfaceFlinger.
      *
@@ -683,4 +685,8 @@ interface ISurfaceComposer {
      * Requires root
      */
      void resetForcedPacesetter();
+
+    /** Private: requires READ_FRAME_BUFFER and the system UID. */
+    void addGameFrameListener(int taskId, int uid, IGameFrameListener listener);
+    void removeGameFrameListener(IGameFrameListener listener);
 }

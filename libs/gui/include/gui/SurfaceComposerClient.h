@@ -46,6 +46,7 @@
 #include <ui/StaticDisplayInfo.h>
 
 #include <android/gui/BnJankListener.h>
+#include <android/gui/IGameFrameListener.h>
 #include <android/gui/ISurfaceComposerClient.h>
 #include <android/gui/RegionSamplingDescriptor.h>
 #include <android/gui/TransactionBarrier.h>
@@ -997,6 +998,9 @@ public:
     static status_t getRegionSamplingListeners(std::vector<gui::RegionSamplingDescriptor>*);
     static status_t addFpsListener(int32_t taskId, const sp<gui::IFpsListener>& listener);
     static status_t removeFpsListener(const sp<gui::IFpsListener>& listener);
+    static status_t addGameFrameListener(int32_t taskId, int32_t uid,
+                                         const sp<gui::IGameFrameListener>& listener);
+    static status_t removeGameFrameListener(const sp<gui::IGameFrameListener>& listener);
     static status_t addTunnelModeEnabledListener(
             const sp<gui::ITunnelModeEnabledListener>& listener);
     static status_t removeTunnelModeEnabledListener(

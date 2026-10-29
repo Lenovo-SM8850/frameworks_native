@@ -4542,6 +4542,79 @@ TEST_F(FrameTimelineTest, computeFps_noLayerIds_returnsZero) {
     EXPECT_EQ(mFrameTimeline->computeFps({}), 0.0f);
 }
 
+TEST_F(FrameTimelineTest, gameFrames_drainPresentFenceWithoutNewComposition) {
+    constexpr int64_t present = 100000000;
+    mFrameTimeline->setGameFrameTracking(true, sUidOne);
+    mFrameTimeline->setGameFrameVisibleLayers({sLayerIdOne, 1, 2, 3, 4});
+    auto frame = mFrameTimeline->createSurfaceFrameForToken(
+            FrameTimelineInfo(), sPidOne, sUidOne, sLayerIdOne, sLayerNameOne, sLayerNameOne,
+            true, sGameMode, sContentPriority);
+    frame->setPresentState(SurfaceFrame::PresentState::Presented);
+    mFrameTimeline->addSurfaceFrame(frame);
+    auto fence = fenceFactory.createFenceTimeForTest(Fence::NO_FENCE);
+    mFrameTimeline->setSfPresent(present, fence);
+    EXPECT_EQ(0, mFrameTimeline->computeGameFrameStats({sLayerIdOne}, present).totalFrames);
+    fence->signalForTest(present);
+    const auto report = mFrameTimeline->computeGameFrameStats({sLayerIdOne}, present);
+    EXPECT_EQ(1, report.totalFrames);
+    EXPECT_FLOAT_EQ(2, report.fps);
+    EXPECT_FALSE(report.stalled);
+    EXPECT_TRUE(mFrameTimeline->computeGameFrameStats({sLayerIdOne}, present + 500000000).stalled);
+}
+
+TEST_F(FrameTimelineTest, gameFrames_captureCompositionVisibilityBeforeFenceAndRetireHiddenLayer) {
+    constexpr int64_t present = 100000000;
+    mFrameTimeline->setGameFrameTracking(true, sUidOne);
+    // Both buffers are latched, but only one is actually in the composition.
+    for (int layer : {1, 2}) {
+        auto frame = mFrameTimeline->createSurfaceFrameForToken(
+                FrameTimelineInfo(), sPidOne, sUidOne, layer, sLayerNameOne, sLayerNameOne,
+                true, sGameMode, sContentPriority);
+        frame->setPresentState(SurfaceFrame::PresentState::Presented);
+        mFrameTimeline->addSurfaceFrame(frame);
+    }
+    mFrameTimeline->setGameFrameVisibleLayers({1});
+    auto fence = fenceFactory.createFenceTimeForTest(Fence::NO_FENCE);
+    mFrameTimeline->setSfPresent(present, fence);
+    // Visibility changes while the older frame's fence is still pending.
+    mFrameTimeline->setGameFrameVisibleLayers({1, 2});
+    fence->signalForTest(present);
+    EXPECT_EQ(0, mFrameTimeline->computeGameFrameStats({2}, present).totalFrames);
+    EXPECT_EQ(1, mFrameTimeline->computeGameFrameStats({1, 2}, present).layerId);
+    mFrameTimeline->setGameFrameVisibleLayers({2});
+    const auto hidden = mFrameTimeline->computeGameFrameStats({1, 2}, present);
+    EXPECT_EQ(-1, hidden.layerId);
+    EXPECT_TRUE(hidden.layerChanged);
+    EXPECT_EQ(0, hidden.totalFrames);
+}
+
+TEST_F(FrameTimelineTest, gameFrames_ignoreForeignUidBufferlessAndInvalidFence) {
+    constexpr int64_t present = 100000000;
+    mFrameTimeline->setGameFrameTracking(true, sUidOne);
+    mFrameTimeline->setGameFrameVisibleLayers({sLayerIdOne, 1, 2, 3, 4});
+    for (int layer : {1, 2, 3}) {
+        auto frame = mFrameTimeline->createSurfaceFrameForToken(
+                FrameTimelineInfo(), sPidOne, layer == 2 ? sUidOne + 1 : sUidOne, layer,
+                sLayerNameOne, sLayerNameOne, layer != 3, sGameMode, sContentPriority);
+        frame->setPresentState(SurfaceFrame::PresentState::Presented);
+        mFrameTimeline->addSurfaceFrame(frame);
+    }
+    auto fence = fenceFactory.createFenceTimeForTest(Fence::NO_FENCE);
+    fence->signalForTest(present);
+    mFrameTimeline->setSfPresent(present, fence);
+    EXPECT_EQ(1, mFrameTimeline->computeGameFrameStats({1}, present).totalFrames);
+    EXPECT_EQ(0, mFrameTimeline->computeGameFrameStats({2, 3}, present).totalFrames);
+    auto invalidFrame = mFrameTimeline->createSurfaceFrameForToken(
+            FrameTimelineInfo(), sPidOne, sUidOne, 4, sLayerNameOne, sLayerNameOne, true,
+            sGameMode, sContentPriority);
+    invalidFrame->setPresentState(SurfaceFrame::PresentState::Presented);
+    mFrameTimeline->addSurfaceFrame(invalidFrame);
+    auto invalidFence = fenceFactory.createFenceTimeForTest(Fence::NO_FENCE);
+    invalidFence->signalForTest(Fence::SIGNAL_TIME_INVALID);
+    mFrameTimeline->setSfPresent(present + 100000000, invalidFence);
+    EXPECT_EQ(0, mFrameTimeline->computeGameFrameStats({4}, present + 100000000).totalFrames);
+}
+
 TEST_F(FrameTimelineTest, computeFps_singleDisplayFrame_returnsZero) {
     const auto oneHundredMs = std::chrono::nanoseconds(100ms).count();
 

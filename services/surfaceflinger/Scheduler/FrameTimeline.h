@@ -41,6 +41,7 @@
 #include <scheduler/Fps.h>
 
 #include "../TimeStats/TimeStats.h"
+#include "GameFrameTracker.h"
 
 namespace android::scheduler {
 
@@ -274,6 +275,7 @@ public:
     // Getter functions used only by FrameTimelineTests and SurfaceFrame internally
     TimelineItem getActuals() const;
     pid_t getOwnerPid() const { return mOwnerPid; };
+    uid_t getOwnerUid() const { return mOwnerUid; }
     int32_t getLayerId() const { return mLayerId; };
     PredictionState getPredictionState() const;
     PresentState getPresentState() const;
@@ -455,6 +457,11 @@ public:
     // The fps is compted from the linear timeline of present timestamps for DisplayFrames
     // containing at least one layer ID.
     virtual float computeFps(const std::unordered_set<int32_t>& layerIds) = 0;
+    virtual void setGameFrameTracking(bool, int32_t) {}
+    virtual bool isGameFrameTracking() const { return false; }
+    virtual void setGameFrameVisibleLayers(std::unordered_set<int32_t>) {}
+    virtual GameFrameTracker::Report computeGameFrameStats(const std::unordered_set<int32_t>&,
+                                                          int64_t) { return {}; }
 
     // Supports the legacy FrameStats interface
     virtual void generateFrameStats(int32_t layer, size_t count, FrameStats* outStats) const = 0;
@@ -541,10 +548,13 @@ public:
         void setActualStartTime(nsecs_t actualStartTime);
         void setActualEndTime(nsecs_t actualEndTime);
         void setGpuFence(const std::shared_ptr<FenceTime>& gpuFence);
+        std::shared_ptr<const std::unordered_set<int32_t>> gameVisibleLayers;
 
         // BaseTime is the smallest timestamp in a DisplayFrame.
         // Used for dumping all timestamps relative to the oldest, making it easy to read.
         nsecs_t getBaseTime() const;
+
+        nsecs_t getVsyncPeriod() const { return mRefreshRate.getPeriodNsecs(); }
 
         // Functions to be used only in testing.
         TimelineItem getActuals() const { return mSurfaceFlingerActuals; };
@@ -642,6 +652,11 @@ public:
     void parseArgs(const Vector<String16>& args, std::string& result) override;
     void setMaxDisplayFrames(uint32_t size) override;
     float computeFps(const std::unordered_set<int32_t>& layerIds) override;
+    void setGameFrameTracking(bool enabled, int32_t uid) override;
+    bool isGameFrameTracking() const override { return mGameFrameTracking.load(); }
+    void setGameFrameVisibleLayers(std::unordered_set<int32_t> layers) override;
+    GameFrameTracker::Report computeGameFrameStats(const std::unordered_set<int32_t>& layers,
+                                                  int64_t now) override;
     void generateFrameStats(int32_t layer, size_t count, FrameStats* outStats) const override;
     void reset() override;
     void onLayerDestroyed(int32_t layerId) override;
@@ -665,11 +680,16 @@ private:
     void flushPendingPresentFences() REQUIRES(mMutex);
     std::optional<size_t> getFirstSignalFenceIndex() const REQUIRES(mMutex);
     void finalizeCurrentDisplayFrame() REQUIRES(mMutex);
+    void recordGameFrames(const DisplayFrame&) REQUIRES(mMutex);
     void dumpAll(std::string& result);
     void dumpJank(std::string& result);
 
     // Sliding window of display frames. TODO(b/168072834): compare perf with fixed size array
     std::deque<std::shared_ptr<DisplayFrame>> mDisplayFrames GUARDED_BY(mMutex);
+    std::atomic<bool> mGameFrameTracking{false};
+    std::shared_ptr<const std::unordered_set<int32_t>> mGameVisibleLayers GUARDED_BY(mMutex);
+    int32_t mGameFrameUid GUARDED_BY(mMutex) = -1;
+    GameFrameTracker mGameFrames GUARDED_BY(mMutex);
     std::vector<std::pair<std::shared_ptr<FenceTime>, std::shared_ptr<DisplayFrame>>>
             mPendingPresentFences GUARDED_BY(mMutex);
     std::shared_ptr<DisplayFrame> mCurrentDisplayFrame GUARDED_BY(mMutex);
