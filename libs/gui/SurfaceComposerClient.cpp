@@ -3338,6 +3338,17 @@ status_t SurfaceComposerClient::removeFpsListener(const sp<gui::IFpsListener>& l
     return statusTFromBinderStatus(status);
 }
 
+status_t SurfaceComposerClient::addGameFrameListener(int32_t taskId, int32_t uid,
+                                                   const sp<gui::IGameFrameListener>& listener) {
+    return statusTFromBinderStatus(
+            ComposerServiceAIDL::getComposerService()->addGameFrameListener(taskId, uid, listener));
+}
+
+status_t SurfaceComposerClient::removeGameFrameListener(const sp<gui::IGameFrameListener>& listener) {
+    return statusTFromBinderStatus(
+            ComposerServiceAIDL::getComposerService()->removeGameFrameListener(listener));
+}
+
 status_t SurfaceComposerClient::addTunnelModeEnabledListener(
         const sp<gui::ITunnelModeEnabledListener>& listener) {
     binder::Status status =

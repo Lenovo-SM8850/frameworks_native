@@ -602,6 +602,9 @@ private:
             std::vector<gui::RegionSamplingDescriptor>* listeners) const;
     status_t addFpsListener(int32_t taskId, const sp<gui::IFpsListener>& listener);
     status_t removeFpsListener(const sp<gui::IFpsListener>& listener);
+    status_t addGameFrameListener(int32_t taskId, int32_t uid, const sp<gui::IGameFrameListener>& listener);
+    status_t removeGameFrameListener(const sp<gui::IGameFrameListener>& listener);
+    void dispatchGameFrame(uint64_t generation);
     status_t addTunnelModeEnabledListener(const sp<gui::ITunnelModeEnabledListener>& listener);
     status_t removeTunnelModeEnabledListener(const sp<gui::ITunnelModeEnabledListener>& listener);
     status_t setDesiredDisplayModeSpecs(const sp<IBinder>& applyToken,
@@ -1870,6 +1873,9 @@ public:
     binder::Status getRegionSamplingListeners(std::vector<gui::RegionSamplingDescriptor>*) override;
     binder::Status addFpsListener(int32_t taskId, const sp<gui::IFpsListener>& listener) override;
     binder::Status removeFpsListener(const sp<gui::IFpsListener>& listener) override;
+    binder::Status addGameFrameListener(int32_t taskId, int32_t uid,
+                                        const sp<gui::IGameFrameListener>& listener) override;
+    binder::Status removeGameFrameListener(const sp<gui::IGameFrameListener>& listener) override;
     binder::Status addTunnelModeEnabledListener(
             const sp<gui::ITunnelModeEnabledListener>& listener) override;
     binder::Status removeTunnelModeEnabledListener(

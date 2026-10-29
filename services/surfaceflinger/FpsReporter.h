@@ -18,6 +18,7 @@
 
 #include <android-base/thread_annotations.h>
 #include <android/gui/IFpsListener.h>
+#include <android/gui/IGameFrameListener.h>
 #include <binder/IBinder.h>
 
 #include <unordered_map>
@@ -49,6 +50,10 @@ public:
     void addListener(const sp<gui::IFpsListener>& listener, int32_t taskId);
     // Deregisters an Fps listener
     void removeListener(const sp<gui::IFpsListener>& listener);
+    uint64_t addGameListener(const sp<gui::IGameFrameListener>& listener, int32_t taskId, int32_t uid);
+    void removeGameListener(const sp<gui::IGameFrameListener>& listener);
+    // Called by a 500 ms scheduler task, including when composition is idle.
+    bool dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy&) EXCLUDES(mMutex);
 
 private:
     mutable std::mutex mMutex;
@@ -64,6 +69,14 @@ private:
     std::unique_ptr<Clock> mClock;
     std::chrono::steady_clock::time_point mLastDispatch;
     std::unordered_map<wp<IBinder>, TrackedListener, WpHash> mListeners GUARDED_BY(mMutex);
+    struct GameListener {
+        sp<gui::IGameFrameListener> listener;
+        int32_t taskId, uid;
+    };
+    std::optional<GameListener> mGameListener GUARDED_BY(mMutex);
+    uint64_t mGameGeneration GUARDED_BY(mMutex) = 0;
+    std::chrono::steady_clock::time_point mGameLogTime GUARDED_BY(mMutex);
+    scheduler::GameFrameTracker::Report mGameLog GUARDED_BY(mMutex);
 };
 
 } // namespace android

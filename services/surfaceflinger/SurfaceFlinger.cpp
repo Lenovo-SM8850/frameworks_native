@@ -2335,6 +2335,31 @@ status_t SurfaceFlinger::removeFpsListener(const sp<gui::IFpsListener>& listener
     return NO_ERROR;
 }
 
+status_t SurfaceFlinger::addGameFrameListener(int32_t taskId, int32_t uid,
+                                             const sp<gui::IGameFrameListener>& listener) {
+    if (!listener || taskId < 0 || uid < 0) return BAD_VALUE;
+    const auto generation = mFpsReporter->addGameListener(listener, taskId, uid);
+    if (!generation) return INVALID_OPERATION;
+    (void)mScheduler->scheduleDelayed([this, generation] { dispatchGameFrame(generation); },
+                                      scheduler::GameFrameTracker::kWindowNs);
+    return NO_ERROR;
+}
+
+status_t SurfaceFlinger::removeGameFrameListener(const sp<gui::IGameFrameListener>& listener) {
+    if (!listener) return BAD_VALUE;
+    mFpsReporter->removeGameListener(listener);
+    return NO_ERROR;
+}
+
+void SurfaceFlinger::dispatchGameFrame(uint64_t generation) {
+    // Both initial dispatch and continuation run on Scheduler's main-thread queue.
+    ftl::FakeGuard guard(kMainThreadContext);
+    const bool active = mFpsReporter->dispatchGameFrame(generation, mLayerHierarchyBuilder.getHierarchy());
+    // A removed/dead listener ends the chain; no periodic task remains while idle.
+    if (active) (void)mScheduler->scheduleDelayed([this, generation] { dispatchGameFrame(generation); },
+                                                 scheduler::GameFrameTracker::kWindowNs);
+}
+
 status_t SurfaceFlinger::addTunnelModeEnabledListener(
         const sp<gui::ITunnelModeEnabledListener>& listener) {
     if (!listener) {
@@ -3479,6 +3504,21 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
     if (mFrontEndDisplayInfosChanged) {
         compositedWorkload |= adpf::Workload::DISPLAY_CHANGES;
         SFTRACE_INSTANT_FOR_TRACK(WorkloadTracer::TRACK_NAME, "Display Changes");
+    }
+
+    // Capture composition visibility before snapshots return to the front end.
+    if (mFrameTimeline->isGameFrameTracking()) {
+        std::unordered_set<int32_t> visible;
+        const auto output = FTL_FAKE_GUARD(mStateLock, getCompositionDisplayLocked(pacesetterId));
+        if (output && output->getState().isEnabled) {
+            for (const auto* layer : output->getOutputLayersOrderedByZ()) {
+                if (layer->getState().visibleRegion.isEmpty()) continue;
+                const auto* snapshot = static_cast<const frontend::LayerSnapshot*>(
+                        layer->getLayerFE().getCompositionState());
+                if (snapshot) visible.insert(snapshot->sequence);
+            }
+        }
+        mFrameTimeline->setGameFrameVisibleLayers(std::move(visible));
     }
 
     traceCompositionSummary(layers);
@@ -10613,6 +10653,22 @@ binder::Status SurfaceComposerAIDL::removeFpsListener(const sp<gui::IFpsListener
         status = mFlinger->removeFpsListener(listener);
     }
     return binderStatusFromStatusT(status);
+}
+
+binder::Status SurfaceComposerAIDL::addGameFrameListener(
+        int32_t taskId, int32_t uid, const sp<gui::IGameFrameListener>& listener) {
+    if (IPCThreadState::self()->getCallingUid() != AID_SYSTEM)
+        return binderStatusFromStatusT(PERMISSION_DENIED);
+    const auto status = checkReadFrameBufferPermission();
+    return binderStatusFromStatusT(status == OK ?
+            mFlinger->addGameFrameListener(taskId, uid, listener) : status);
+}
+
+binder::Status SurfaceComposerAIDL::removeGameFrameListener(const sp<gui::IGameFrameListener>& listener) {
+    if (IPCThreadState::self()->getCallingUid() != AID_SYSTEM)
+        return binderStatusFromStatusT(PERMISSION_DENIED);
+    const auto status = checkReadFrameBufferPermission();
+    return binderStatusFromStatusT(status == OK ? mFlinger->removeGameFrameListener(listener) : status);
 }
 
 binder::Status SurfaceComposerAIDL::addTunnelModeEnabledListener(
