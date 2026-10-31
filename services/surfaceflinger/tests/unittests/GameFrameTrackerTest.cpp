@@ -22,6 +22,58 @@ TEST(GameFrameTrackerTest, CountsOnlyPresentedBuffersAndExcludesOverlayFrames) {
     EXPECT_FALSE(tracker.report({1, 2, 3, 4}, 1501 * ms).layerChanged);
 }
 
+TEST(GameFrameTrackerTest, ReportsLongestGapBetweenConsecutivePresents) {
+    GameFrameTracker tracker;
+    for (const int64_t t : {1100, 1110, 1150, 1160, 1250, 1260})
+        tracker.add(1, t * ms, true, true);
+    // Gaps are 10, 40, 10, 90 and 10 ms.
+    const auto report = tracker.report({1}, 1300 * ms);
+    EXPECT_EQ(6, report.totalFrames);
+    EXPECT_EQ(90000, report.maxFrameTimeUs);
+}
+
+TEST(GameFrameTrackerTest, FewerThanTwoPresentsHaveNoFrameTime) {
+    GameFrameTracker tracker;
+    tracker.add(1, 1400 * ms, true, true);
+    auto report = tracker.report({1}, 1450 * ms);
+    EXPECT_EQ(1, report.totalFrames);
+    EXPECT_EQ(-1, report.maxFrameTimeUs);
+    // A stalled report carries no frame time either.
+    EXPECT_EQ(-1, tracker.report({1}, 2000 * ms).maxFrameTimeUs);
+}
+
+TEST(GameFrameTrackerTest, FrameTimeCountsGapIntoTheWindow) {
+    GameFrameTracker tracker;
+    // The window is (900, 1400] ms. The frame at 900 is outside, but the gap from it to the
+    // first frame inside is that frame's time.
+    for (const int64_t t : {800, 900, 1100, 1120, 1140})
+        tracker.add(1, t * ms, true, true);
+    auto report = tracker.report({1}, 1400 * ms);
+    EXPECT_EQ(3, report.totalFrames);
+    EXPECT_EQ(200000, report.maxFrameTimeUs);
+    // A frame exactly at the end of the window is inside.
+    tracker.add(1, 1400 * ms, true, true);
+    report = tracker.report({1}, 1400 * ms);
+    EXPECT_EQ(4, report.totalFrames);
+    EXPECT_EQ(260000, report.maxFrameTimeUs);
+}
+
+TEST(GameFrameTrackerTest, FrameTimeRetainsBaselineBeforeTrimmedHistory) {
+    GameFrameTracker tracker;
+    for (const int64_t t : {1000, 1800, 1900, 2000, 2100})
+        tracker.add(1, t * ms, true, true);
+    // The 1000 ms present was trimmed, but its interval ends inside (1650, 2150].
+    const auto report = tracker.report({1}, 2150 * ms);
+    EXPECT_EQ(4, report.totalFrames);
+    EXPECT_EQ(800000, report.maxFrameTimeUs);
+    // A trimmed baseline must not leak to another layer or survive a reset.
+    tracker.add(2, 2200 * ms, true, true);
+    EXPECT_EQ(-1, tracker.report({2}, 2250 * ms).maxFrameTimeUs);
+    tracker.reset();
+    tracker.add(1, 2300 * ms, true, true);
+    EXPECT_EQ(-1, tracker.report({1}, 2350 * ms).maxFrameTimeUs);
+}
+
 TEST(GameFrameTrackerTest, HiddenProducingBuffersDoNotWinAndHiddenSelectionIsRetired) {
     GameFrameTracker tracker;
     for (int i = 1; i <= 60; ++i) {

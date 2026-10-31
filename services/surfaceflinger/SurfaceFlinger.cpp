@@ -2353,7 +2353,9 @@ status_t SurfaceFlinger::removeGameFrameListener(const sp<gui::IGameFrameListene
 void SurfaceFlinger::dispatchGameFrame(uint64_t generation) {
     // Both initial dispatch and continuation run on Scheduler's main-thread queue.
     ftl::FakeGuard guard(kMainThreadContext);
-    const bool active = mFpsReporter->dispatchGameFrame(generation, mLayerHierarchyBuilder.getHierarchy());
+    const bool active = mFpsReporter->dispatchGameFrame(
+            generation, mLayerHierarchyBuilder.getHierarchy(), mLayerSnapshotBuilder,
+            [this](uid_t uid) { return mScheduler->getGameModeFrameRateForUid(uid); });
     // A removed/dead listener ends the chain; no periodic task remains while idle.
     if (active) (void)mScheduler->scheduleDelayed([this, generation] { dispatchGameFrame(generation); },
                                                  scheduler::GameFrameTracker::kWindowNs);

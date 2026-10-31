@@ -21,10 +21,12 @@
 #include <android/gui/IGameFrameListener.h>
 #include <binder/IBinder.h>
 
+#include <functional>
 #include <unordered_map>
 
 #include "Clock.h"
 #include "FrontEnd/LayerHierarchy.h"
+#include "FrontEnd/LayerSnapshotBuilder.h"
 #include "Scheduler/FrameTimeline.h"
 #include "WpHash.h"
 
@@ -53,7 +55,11 @@ public:
     uint64_t addGameListener(const sp<gui::IGameFrameListener>& listener, int32_t taskId, int32_t uid);
     void removeGameListener(const sp<gui::IGameFrameListener>& listener);
     // Called by a 500 ms scheduler task, including when composition is idle.
-    bool dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy&) EXCLUDES(mMutex);
+    // The snapshots give the frame rate votes of the task's layers; gameModeFrameRate returns the
+    // intervention frame rate of a uid, 0 when none.
+    bool dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy&,
+                           const frontend::LayerSnapshotBuilder&,
+                           const std::function<float(uid_t)>& gameModeFrameRate) EXCLUDES(mMutex);
 
 private:
     mutable std::mutex mMutex;

@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "FpsReporter.h"
+#include "FrontEnd/LayerSnapshotBuilder.h"
 #include "Layer.h"
 #include "SurfaceFlinger.h"
 
@@ -134,9 +135,12 @@ void FpsReporter::removeGameListener(const sp<gui::IGameFrameListener>& listener
     mFrameTimeline.setGameFrameTracking(false, -1);
 }
 
-bool FpsReporter::dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy& hierarchy) {
+bool FpsReporter::dispatchGameFrame(uint64_t generation, const frontend::LayerHierarchy& hierarchy,
+                                     const frontend::LayerSnapshotBuilder& snapshots,
+                                     const std::function<float(uid_t)>& gameModeFrameRate) {
     sp<gui::IGameFrameListener> listener;
     scheduler::GameFrameTracker::Report report;
+    float requestedFps = -1, throttleFps = -1;
     {
         std::lock_guard lock(mMutex);
         if (!mGameListener || generation != mGameGeneration) return false;
@@ -161,6 +165,24 @@ bool FpsReporter::dispatchGameFrame(uint64_t generation, const frontend::LayerHi
             return false;
         });
         report = mFrameTimeline.computeGameFrameStats(layers, systemTime(SYSTEM_TIME_MONOTONIC));
+        // Use the same composition-visible layers as the frame counts above.
+        // Highest explicit vote among these layers. A rate set with the default
+        // compatibility is still an explicit request; valueless and category-only votes are not.
+        for (const int32_t id : report.visibleLayers) {
+            const auto* snapshot = snapshots.getSnapshot(static_cast<uint32_t>(id));
+            if (!snapshot) continue;
+            const auto& vote = snapshot->frameRate.vote;
+            if (!vote.rate.isValid()) continue;
+            if (vote.type != scheduler::FrameRateCompatibility::Default &&
+                vote.type != scheduler::FrameRateCompatibility::Exact &&
+                vote.type != scheduler::FrameRateCompatibility::ExactOrMultiple &&
+                vote.type != scheduler::FrameRateCompatibility::Gte) continue;
+            requestedFps = std::max(requestedFps, vote.rate.getValue());
+        }
+        if (gameModeFrameRate) {
+            const float limit = gameModeFrameRate(static_cast<uid_t>(tracked.uid));
+            if (limit > 0.f) throttleFps = limit;
+        }
         listener = tracked.listener;
         mGameLog.totalFrames += report.totalFrames;
         mGameLog.appJankFrames += report.appJankFrames;
@@ -184,6 +206,8 @@ bool FpsReporter::dispatchGameFrame(uint64_t generation, const frontend::LayerHi
     stats.layerChanged = report.layerChanged; stats.stalled = report.stalled;
     stats.appDeadlineMissed = report.appDeadlineMissed; stats.bufferStuffing = report.bufferStuffing;
     stats.predictionErrors = report.predictionErrors; stats.compositorJankFrames = report.compositorJankFrames;
+    stats.maxFrameTimeUs = report.maxFrameTimeUs;
+    stats.requestedFps = requestedFps; stats.throttleFps = throttleFps;
     listener->onFrameReported(stats);
     std::lock_guard lock(mMutex);
     return mGameListener && generation == mGameGeneration;

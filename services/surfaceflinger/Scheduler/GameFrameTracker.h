@@ -7,6 +7,7 @@
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace android::scheduler {
 
@@ -20,12 +21,15 @@ public:
         int32_t appJankFrames = 0, totalFrames = 0, windowMs = 500, layerId = -1;
         int32_t appDeadlineMissed = 0, bufferStuffing = 0, predictionErrors = 0;
         int32_t compositorJankFrames = 0;
+        // Largest gap between consecutive presents ending in the window, -1 when unknown.
+        int32_t maxFrameTimeUs = -1;
         // Provenance stays local to SF; no wire/API change is needed for feedback.
         int32_t classifiedFrames = 0, cadenceFrames = 0, cadenceJankFrames = 0;
+        std::unordered_set<int32_t> visibleLayers;
         bool layerChanged = false, stalled = true;
     };
 
-    void reset() { mFrames.clear(); mLayer = -1; mLastPresent = mNewest = 0; resetCadence(); }
+    void reset() { mFrames.clear(); mTrimmedPresents.clear(); mLayer = -1; mLastPresent = mNewest = 0; resetCadence(); }
 
     void add(int32_t layer, int64_t present, bool buffer, bool presented,
              bool appDeadline = false, bool stuffing = false, bool prediction = false,
@@ -42,8 +46,12 @@ public:
         mFrames.push_back({layer, present, appDeadline, stuffing, prediction, compositor,
                            hasPrediction, cadenceJank});
         // Retain fence-completion headroom; reports still filter at dispatch time.
-        while (!mFrames.empty() && mFrames.front().present <= mNewest - 2 * kWindowNs)
+        while (!mFrames.empty() && mFrames.front().present <= mNewest - 2 * kWindowNs) {
+            const auto& frame = mFrames.front();
+            auto& baseline = mTrimmedPresents[frame.layer];
+            baseline = std::max(baseline, frame.present);
             mFrames.pop_front();
+        }
         if (layer == mLayer) mLastPresent = std::max(mLastPresent, present);
     }
 
@@ -72,8 +80,19 @@ public:
         result.layerChanged = previous != mLayer;
         result.stalled = mLastPresent <= 0 || now - mLastPresent >= kWindowNs;
         if (result.stalled) { resetCadence(); return result; }
+        std::vector<int64_t> presents;
+        presents.reserve(mFrames.size());
+        // Keep the last present before retained history to time a gap into the window.
+        int64_t baseline = 0;
+        if (const auto it = mTrimmedPresents.find(mLayer);
+            it != mTrimmedPresents.end() && it->second <= now - kWindowNs) {
+            baseline = it->second;
+        }
         for (const auto& frame : mFrames) {
+            if (frame.layer == mLayer && frame.present <= now - kWindowNs)
+                baseline = std::max(baseline, frame.present);
             if (frame.layer != mLayer || frame.present <= now - kWindowNs || frame.present > now) continue;
+            presents.push_back(frame.present);
             ++result.totalFrames;
             result.appDeadlineMissed += frame.appDeadline;
             result.bufferStuffing += frame.stuffing;
@@ -88,6 +107,15 @@ public:
                                                        : frame.cadenceJank;
         }
         result.fps = result.totalFrames * 1000.0f / result.windowMs;
+        if (!presents.empty() && baseline > 0) presents.push_back(baseline);
+        if (presents.size() >= 2) {
+            std::sort(presents.begin(), presents.end());
+            int64_t longest = 0;
+            for (size_t i = 1; i < presents.size(); ++i)
+                longest = std::max(longest, presents[i] - presents[i - 1]);
+            result.maxFrameTimeUs = static_cast<int32_t>(
+                    std::min<int64_t>(longest / 1000, INT32_MAX));
+        }
         return result;
     }
 
@@ -156,6 +184,7 @@ private:
     size_t mIntervalCount = 0, mIntervalNext = 0;
     int64_t mCadenceLastPresent = 0, mPreviousLongInterval = 0, mCadencePeriod = 0;
     std::deque<Frame> mFrames;
+    std::unordered_map<int32_t, int64_t> mTrimmedPresents;
     int32_t mLayer = -1;
     int64_t mLastPresent = 0, mNewest = 0;
 };

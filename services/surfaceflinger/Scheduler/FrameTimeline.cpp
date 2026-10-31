@@ -2026,7 +2026,9 @@ GameFrameTracker::Report FrameTimeline::computeGameFrameStats(
     if (mGameVisibleLayers) {
         for (auto layer : layers) if (mGameVisibleLayers->count(layer)) visible.insert(layer);
     }
-    return mGameFrames.report(visible, now);
+    auto report = mGameFrames.report(visible, now);
+    report.visibleLayers = std::move(visible);
+    return report;
 }
 
 void FrameTimeline::recordGameFrames(const DisplayFrame& display) {
