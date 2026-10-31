@@ -14,4 +14,10 @@ parcelable GameFrameStats {
     int bufferStuffing;
     int predictionErrors;
     int compositorJankFrames;
+    // Longest interval between consecutive presents in the window; -1 with fewer than two.
+    int maxFrameTimeUs = -1;
+    // Highest explicit frame rate vote among the task's visible layers; -1 when none.
+    float requestedFps = -1.0f;
+    // Frame rate override of the game's uid from the game mode intervention; -1 when none.
+    float throttleFps = -1.0f;
 }

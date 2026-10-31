@@ -326,6 +326,11 @@ public:
     // FrameRateOverride.refreshRateHz == 0 means no preference.
     void setGameModeFrameRateForUid(FrameRateOverride) EXCLUDES(mDisplayLock);
 
+    // Returns the game mode intervention frame rate of the uid, 0 when none.
+    float getGameModeFrameRateForUid(uid_t uid) const {
+        return mLayerHistory.getGameFrameRateOverride(uid).first.getValue();
+    }
+
     // Stores the frame rate override that a game should run rat set by default game frame rate.
     // FrameRateOverride.refreshRateHz == 0 means no preference, game default game frame rate is not
     // enabled.
