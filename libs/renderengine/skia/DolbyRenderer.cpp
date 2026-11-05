@@ -265,7 +265,6 @@ public:
         sk_sp<SkImage> image;
         Uniforms uniforms;
         std::string text;
-        std::chrono::steady_clock::time_point generated;
 
         bool matches(const Request& request, bool allowToneMappingLag = false) const {
             return id == request.id && fp16 == request.fp16 && vulkan == request.vulkan &&
@@ -331,7 +330,6 @@ public:
         if (!frame->image) return nullptr;
         frame->uniforms = std::move(uniforms);
         frame->text = text;
-        frame->generated = std::chrono::steady_clock::now();
         return frame;
     }
 
@@ -340,8 +338,12 @@ public:
         std::shared_ptr<const Frame> frame;
         Request retiredRequest;
         request.outputDataspace = outputDataspace;
+        const std::string layerName = request.name;
         bool compatibleFrame = false;
         bool matchingMetadata = false;
+        bool lutOverdue = false;
+        bool seeked = false;
+        const auto timestamp = request.timestamp;
         // Only move queue entries / shared snapshots under this mutex. The
         // worker never holds it during blob calls, Binder or LUT generation.
         {
@@ -352,17 +354,37 @@ public:
             compatibleFrame = frame && frame->matches(request, true);
             matchingMetadata = compatibleFrame && frame->metadata == request.metadata &&
                     frame->timestamp == request.timestamp;
+            if (!matchingMetadata) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto waiting = mLutWaits.try_emplace(request.name, now).first->second;
+                lutOverdue = now - waiting > std::chrono::milliseconds(100);
+                seeked = compatibleFrame && !lutOverdue &&
+                        std::abs(int64_t(timestamp - frame->timestamp)) > kSeekGapUs;
+            }
             auto& queued = mRequests[request.name];
             retiredRequest = std::move(queued);
             queued = std::move(request);
         }
         mWake.notify_one();
+        // After a seek the previous LUT tone maps another scene and flashes for
+        // a frame. Its own takes milliseconds, so hold this one frame for it.
+        if (seeked) {
+            std::unique_lock lock(mQueueMutex);
+            mPublished.wait_for(lock, std::chrono::milliseconds(20), [&] {
+                const auto entry = mFrames.find(layerName);
+                if (entry == mFrames.end() || entry->second->timestamp != timestamp) return false;
+                frame = entry->second;
+                return true;
+            });
+        }
         // A paused buffer can be recomposed long after its LUT was generated.
-        // Identical metadata, timestamp and compatible color state remain valid;
-        // only the previous-frame playback allowance is bounded to 100 ms.
+        // Identical metadata, timestamp and compatible color state remain valid.
+        // A newer buffer keeps the previous LUT for up to 100 ms of waiting for
+        // its own. That counts from the wait, not from the previous LUT: after
+        // a seek the decoder has stalled for longer than that, and the fallback
+        // cannot show a buffer that needs its Dolby transform.
         if (!serviceReady.load() || !frame || frame->epoch != epoch.load() || !compatibleFrame ||
-            (!matchingMetadata && std::chrono::steady_clock::now() - frame->generated >
-                            std::chrono::milliseconds(100)))
+            lutOverdue)
             return nullptr;
         // Keep the previous LUT and its uniforms together while dimming or
         // display luminance catches up. Their tone mapping can lag, but the
@@ -416,6 +438,7 @@ public:
                 retired = std::move(entry->second);
                 mFrames.erase(entry);
             }
+            mLutWaits.erase(name);
         }
         mWake.notify_one();
     }
@@ -473,6 +496,8 @@ private:
                             epoch.load() == generation) {
                             retired = std::move(mFrames[name]);
                             mFrames[name] = std::move(frame);
+                            mLutWaits.erase(name);
+                            mPublished.notify_all();
                         }
                     }
                 }
@@ -481,11 +506,16 @@ private:
         }
     }
 
+    // Timestamps are in microseconds. Normal frames are at most tens of ms apart.
+    static constexpr int64_t kSeekGapUs = 100'000;
+
     std::mutex mQueueMutex;
     std::condition_variable mWake;
+    std::condition_variable mPublished;
     std::map<std::string, Request> mRequests;
     std::map<std::string, uint64_t> mSerials;
     std::map<std::string, std::shared_ptr<const Frame>> mFrames;
+    std::map<std::string, std::chrono::steady_clock::time_point> mLutWaits;
     std::mutex mShaderMutex;
     std::array<std::string, 2> mRuntimeTexts;
 
