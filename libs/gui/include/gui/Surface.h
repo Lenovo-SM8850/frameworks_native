@@ -31,6 +31,7 @@
 #include <utils/RefBase.h>
 #include <utils/String8.h>
 
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <unordered_set>
@@ -40,6 +41,10 @@ namespace android {
 class GraphicBuffer;
 
 #ifndef NO_BINDER
+namespace libguiextension {
+class QtiSurfaceExtensionGPP;
+}
+
 namespace hardware {
 namespace graphics {
 namespace bufferqueue {
@@ -924,6 +929,12 @@ protected:
     int32_t mGedPid = -1;
     bool mGedIsSurfaceFlinger = false;
     uint64_t mGedWndId = 0;
+
+#ifndef NO_BINDER
+    friend class libguiextension::QtiSurfaceExtensionGPP;
+    std::unique_ptr<libguiextension::QtiSurfaceExtensionGPP> mQtiSurfaceGPPExtn;
+
+#endif
 };
 
 } // namespace android

@@ -101,6 +101,11 @@ class BufferItem : public Flattenable<BufferItem> {
     // mFrameNumber is the number of the queued frame for this slot.
     uint64_t mFrameNumber;
 
+    // mNumDroppedBuffers is how many older queued buffers acquireBuffer dropped for this one.
+    // The prebuilt game post-processing libraries read mSlot and the members after it directly,
+    // so this member has to stay in front of mSlot.
+    int mNumDroppedBuffers;
+
     // mSlot is the slot index of this buffer (default INVALID_BUFFER_SLOT).
     int mSlot;
 

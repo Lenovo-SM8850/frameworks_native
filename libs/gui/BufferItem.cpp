@@ -48,6 +48,7 @@ BufferItem::BufferItem()
         mIsAutoTimestamp(false),
         mDataSpace(HAL_DATASPACE_UNKNOWN),
         mFrameNumber(0),
+        mNumDroppedBuffers(0),
         mSlot(INVALID_BUFFER_SLOT),
         mIsDroppable(false),
         mAcquireCalled(false),
@@ -82,6 +83,7 @@ size_t BufferItem::getPodSize() const {
 #endif // COM_ANDROID_GRAPHICS_LIBUI_FLAGS_APPLY_PICTURE_PROFILES
     addAligned(size, low32(mFrameNumber));
     addAligned(size, high32(mFrameNumber));
+    addAligned(size, mNumDroppedBuffers);
     addAligned(size, mSlot);
     addAligned(size, mIsDroppable);
     addAligned(size, mAcquireCalled);
@@ -186,6 +188,7 @@ status_t BufferItem::flatten(
 #endif // COM_ANDROID_GRAPHICS_LIBUI_FLAGS_APPLY_PICTURE_PROFILES
     writeAligned(buffer, size, low32(mFrameNumber));
     writeAligned(buffer, size, high32(mFrameNumber));
+    writeAligned(buffer, size, mNumDroppedBuffers);
     writeAligned(buffer, size, mSlot);
     writeAligned(buffer, size, mIsDroppable);
     writeAligned(buffer, size, mAcquireCalled);
@@ -268,6 +271,7 @@ status_t BufferItem::unflatten(
     readAligned(buffer, size, frameNumberLo);
     readAligned(buffer, size, frameNumberHi);
     mFrameNumber = to64<uint64_t>(frameNumberLo, frameNumberHi);
+    readAligned(buffer, size, mNumDroppedBuffers);
     readAligned(buffer, size, mSlot);
     readAligned(buffer, size, mIsDroppable);
     readAligned(buffer, size, mAcquireCalled);

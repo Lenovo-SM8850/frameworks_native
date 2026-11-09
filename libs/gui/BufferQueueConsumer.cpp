@@ -282,6 +282,7 @@ status_t BufferQueueConsumer::acquireBuffer(BufferItem* outBuffer,
         } else {
             slot = front->mSlot;
             *outBuffer = *front;
+            outBuffer->mNumDroppedBuffers = numDroppedBuffers;
         }
 
         ATRACE_BUFFER_INDEX(slot);

@@ -326,6 +326,7 @@ filegroup {
         "LayerState.cpp",
         "DisplayLuts.cpp",
         "OccupancyTracker.cpp",
+        "QtiExtension/QtiSurfaceExtensionGPP.cpp",
         "StreamSplitter.cpp",
         "ScreenCaptureResults.cpp",
         "Surface.cpp",
