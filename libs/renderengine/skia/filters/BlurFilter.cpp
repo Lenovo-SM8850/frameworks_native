@@ -623,8 +623,10 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
     const auto blurShader = blurredImage->makeShader(SkTileMode::kMirror, SkTileMode::kMirror,
                                                      linearSampling, &blurMatrix);
 
+    bool windowGlass = false;
     if (material == 0 && mLiquidGlass && mCosGlassEffect != nullptr && cosGlassStyle()) {
-        material = effectRegion.isRect() ? 5 : 1;
+        windowGlass = effectRegion.isRect();
+        material = windowGlass ? 5 : 1;
     }
 
     if (material > 0 && mCosGlassEffect != nullptr) {
@@ -672,6 +674,11 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         setLensUniforms(glass, glassLens(effectRegion, material, mLiquidGlass));
         paint.setShader(glass.makeShader());
         paint.setAntiAlias(true);
+        if (windowGlass && mMaxCrossFadeRadius > 0 && blurRadius < mMaxCrossFadeRadius) {
+            // The window's dark panel tint fades in with the radius, as the plain blur's crossfade
+            // does, instead of darkening the whole screen at full strength from the first radius.
+            paint.setAlphaf(blurAlpha * static_cast<float>(blurRadius) / mMaxCrossFadeRadius);
+        }
         canvas->drawRRect(effectRegion, paint);
         return;
     }
