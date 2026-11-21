@@ -1260,9 +1260,23 @@ void SkiaRenderEngine::drawLayersInternal(
                     // home's wallpaper blur while an app closes, stays a plain blur.
                     const int32_t material =
                             layer.name.starts_with("VRI-NotificationShade#") ? 0 : -1;
+                    // A shade that draws its own panel glass, a region of a panel material (5 or
+                    // 6) over the whole window, tints it for its theme and fades it in with the
+                    // shade. The window blur under it then takes no dark panel tint of its own,
+                    // which would show through while that glass fades in and dim the screen
+                    // before the shade's content arrives.
+                    bool panelRegion = false;
+                    for (const BlurRegion& region : layer.blurRegions) {
+                        if (region.blurRadius > 0 &&
+                            (region.material == 5 || region.material == 6)) {
+                            panelRegion = true;
+                            break;
+                        }
+                    }
                     mBlurFilter->drawBlurRegion(canvas, bounds, layer.backgroundBlurRadius,
                                                 layer.backgroundBlurScale, 1.0f, blurRect,
-                                                temporaryBlurredImage, blurInput, material);
+                                                temporaryBlurredImage, blurInput, material,
+                                                !panelRegion);
                 }
 
                 if (layer.blurRegions.size()) {

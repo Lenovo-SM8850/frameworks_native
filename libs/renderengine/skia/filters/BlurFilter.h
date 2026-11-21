@@ -60,12 +60,14 @@ public:
      * @param blurRect bounds of the blurredImage translated into canvas coordinates
      * @param blurredImage down-sampled blurred content that was produced by the generate() method
      * @param input original unblurred input that is used to crossfade with the blurredImage
+     * @param panelTint whether a rectangle of material 0 takes the dark panel glass in the COS
+     *        style; false when a panel region drawn over it already tints it
      */
     void drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
                                 const uint32_t blurRadius, const float zoomScale,
                                 const float blurAlpha, const SkRect& blurRect,
                                 sk_sp<SkImage> blurredImage, sk_sp<SkImage> input,
-                                int32_t material = 0);
+                                int32_t material = 0, bool panelTint = true);
 
     float getMaxCrossFadeRadius() const;
 

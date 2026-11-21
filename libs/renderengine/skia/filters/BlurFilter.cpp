@@ -611,7 +611,7 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
                                 const uint32_t blurRadius, const float zoomScale,
                                 const float blurAlpha,
                                 const SkRect& blurRect, sk_sp<SkImage> blurredImage,
-                                sk_sp<SkImage> input, int32_t material) {
+                                sk_sp<SkImage> input, int32_t material, bool panelTint) {
     SFTRACE_CALL();
 
     SkPaint paint;
@@ -624,7 +624,8 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
                                                      linearSampling, &blurMatrix);
 
     bool windowGlass = false;
-    if (material == 0 && mLiquidGlass && mCosGlassEffect != nullptr && cosGlassStyle()) {
+    if (material == 0 && mLiquidGlass && mCosGlassEffect != nullptr && cosGlassStyle() &&
+        (panelTint || !effectRegion.isRect())) {
         windowGlass = effectRegion.isRect();
         material = windowGlass ? 5 : 1;
     }
