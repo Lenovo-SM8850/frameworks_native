@@ -250,6 +250,8 @@ const SkString kEffectSource_CosGlassEffect(LENS_SKSL R"(
         } else if (mode == 5) {
             col = mix(col, luminosity(c.rgb, col), c.a);
             col = mix(col, colorDodge(c.rgb, col), c.a);
+        } else if (mode == 7) {
+            col = mix(col, luminosity(c.rgb, col), c.a);
         } else if (mode == 6) {
             // Neutral glass retains dark/saturated content instead of washing it with grey.
             half luminance = dot(col, half3(0.2126, 0.7152, 0.0722));
@@ -454,6 +456,11 @@ float BlurFilter::lensReach(const SkRRect& region, int32_t material) const {
     return glassLens(region, material, mLiquidGlass).shift;
 }
 
+// The island's cards: the blurred backdrop takes the luminance of a dark gray, keeping its hue and
+// saturation, then a light gray overlay, without a rim, glow or lens. The colours behind a card
+// come through and the card's own shade sets its contrast.
+static constexpr int32_t kIslandMaterial = 12;
+
 struct CosGlassLayers {
     SkV4 modes;
     SkV4 colors[4];
@@ -628,6 +635,38 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         (panelTint || !effectRegion.isRect())) {
         windowGlass = effectRegion.isRect();
         material = windowGlass ? 5 : 1;
+    }
+
+    // The island's cards take their own glass, never a tile's or panel's. Below the crossfade
+    // radius the glass fades in with the radius, as the plain blur's crossfade does.
+    if (material == kIslandMaterial) {
+        if (mCosGlassEffect == nullptr) {
+            material = -1;
+        } else {
+            SkRuntimeShaderBuilder glass(mCosGlassEffect);
+            glass.child("blurredInput") = blurShader;
+            glass.uniform("modes") = SkV4{7, 2, 0, 0};
+            glass.uniform("color0") = argb(0xB3262626);
+            glass.uniform("color1") = argb(0x4DB3B3B3);
+            glass.uniform("color2") = SkV4{0, 0, 0, 0};
+            glass.uniform("color3") = SkV4{0, 0, 0, 0};
+            glass.uniform("lift") = SkV4{1.0f, 0.0f, 1.0f, 0.0f};
+            const SkRect& rect = effectRegion.rect();
+            const float edge[16] = {};
+            const float glow[9] = {};
+            glass.uniform("bounds") = SkV4{rect.fLeft, rect.fTop, rect.fRight, rect.fBottom};
+            glass.uniform("radius") = effectRegion.radii(SkRRect::kUpperLeft_Corner).fX;
+            glass.uniform("edge").set(edge, 16);
+            glass.uniform("glow").set(glow, 9);
+            setLensUniforms(glass, GlassLens{});
+            paint.setShader(glass.makeShader());
+            paint.setAntiAlias(true);
+            if (mMaxCrossFadeRadius > 0 && blurRadius < mMaxCrossFadeRadius) {
+                paint.setAlphaf(blurAlpha * static_cast<float>(blurRadius) / mMaxCrossFadeRadius);
+            }
+            canvas->drawRRect(effectRegion, paint);
+            return;
+        }
     }
 
     if (material > 0 && mCosGlassEffect != nullptr) {
