@@ -33,6 +33,8 @@
 #include <sys/system_properties.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -382,6 +384,173 @@ static float tune(const char* name, float fallback) {
     return end != value.c_str() && std::isfinite(parsed) ? parsed : fallback;
 }
 
+// The same, for one material: debug.evolution.lg.sf.m<material>_<key>.
+static float tuneMaterial(int32_t material, const char* key, float fallback) {
+    char name[32];
+    snprintf(name, sizeof(name), "m%d_%s", material, key);
+    return tune(name, fallback);
+}
+
+// What one material's glass is made of, once its tunables are resolved: the scale of its colour
+// layers' alphas, the lift (rgb * gain + add, then saturation), and the rim and glow multipliers.
+struct MaterialRecipe {
+    float layerScale = 1.0f;
+    // The light card's layer alphas from its older properties, NaN while unset.
+    float layer0Alpha = NAN;
+    float layer1Alpha = NAN;
+    float gain = 1.0f;
+    float add = 0.0f;
+    float sat = 1.0f;
+    float rim = 1.0f;
+    float glow = 1.0f;
+    float rimPx = 0.875f;
+};
+
+struct GlassTunables {
+    // Every material without Liquid Glass, and those it doesn't tune, which keep the cos_* props.
+    MaterialRecipe plain;
+    MaterialRecipe glass[15];
+};
+
+static bool tunedGlassMaterial(int32_t material) {
+    return (material >= 1 && material <= 10) || material == 13 || material == 14;
+}
+
+// The panels, 5 and 6, draw no rim or glow.
+static bool glassHasRim(int32_t material) {
+    return (material >= 1 && material <= 4) || (material >= 7 && material <= 10) ||
+            material == 13 || material == 14;
+}
+
+// The dialogs, 13 and 14, have no colour layers for a layer scale to act on.
+static bool glassHasLayers(int32_t material) {
+    return material != 13 && material != 14;
+}
+
+// A rim or glow multiplier's product with the global one stays finite for the shader.
+static constexpr float kMaxRimGlowScale = 100.0f;
+
+static float rimGlowScale(float perMaterial, float global) {
+    return std::clamp(std::max(perMaterial, 0.0f) * global, -kMaxRimGlowScale, kMaxRimGlowScale);
+}
+
+struct GlassDefaults {
+    float layers;
+    float gain;
+    float add;
+    float sat;
+};
+
+// The materials' values under Liquid Glass. The light ones leave their colour layers off and lift
+// the backdrop instead, so the colours behind them stay.
+static GlassDefaults glassDefaults(int32_t material) {
+    switch (material) {
+        case 1:
+            return {1.0f, 1.0f, 0.0f, 1.4f};
+        case 3:
+            return {0.0f, 1.0f, 0.06f, 1.2f};
+        case 6:
+            return {0.0f, 0.70f, 0.0f, 1.5f};
+        case 7:
+            return {1.0f, 0.6f, 0.0f, 1.5f};
+        case 8:
+            return {0.0f, 0.90f, 0.24f, 1.3f};
+        case 13:
+            return {0.0f, 0.50f, 0.07f, 1.5f};
+        case 14:
+            return {0.0f, 0.42f, 0.55f, 1.6f};
+        default:
+            return {1.0f, 1.0f, 0.0f, 1.0f};
+    }
+}
+
+// Per value, m<material>_<key> wins over the older property (card_* for 7, light_card_* for 8,
+// cos_* for the rest), which wins over the default. Unset reads come back as NaN.
+static MaterialRecipe resolveGlassRecipe(int32_t material, float legacyGain, float legacyAdd,
+                                         float legacySat, float cosRim, float cosGlow,
+                                         float rimPx) {
+    const GlassDefaults d = glassDefaults(material);
+    MaterialRecipe r;
+    if (glassHasLayers(material)) {
+        r.layerScale = std::clamp(tuneMaterial(material, "layers", d.layers), 0.0f, 1.0f);
+    }
+    r.gain = std::clamp(tuneMaterial(material, "gain",
+                                     std::isfinite(legacyGain) ? legacyGain : d.gain),
+                        0.0f, 4.0f);
+    r.add = std::clamp(tuneMaterial(material, "add", std::isfinite(legacyAdd) ? legacyAdd : d.add),
+                       -1.0f, 1.0f);
+    r.sat = std::clamp(tuneMaterial(material, "sat", std::isfinite(legacySat) ? legacySat : d.sat),
+                       0.0f, 4.0f);
+    if (glassHasRim(material)) {
+        r.rim = rimGlowScale(tuneMaterial(material, "rim", 1.0f), cosRim);
+        r.glow = rimGlowScale(tuneMaterial(material, "glow", 1.0f), cosGlow);
+    }
+    r.rimPx = rimPx;
+    return r;
+}
+
+static void refreshGlassTunables(GlassTunables& table) {
+    const float cosRim = tune("cos_rim", 1.0f);
+    const float cosGlow = tune("cos_glow", 1.0f);
+    const float rimPx = tune("cos_rim_px", 0.875f);
+    const float cosGain = tune("cos_gain", NAN);
+    const float cosAdd = tune("cos_add", NAN);
+    const float cosSat = tune("cos_sat", NAN);
+    const float cardGain = tune("card_gain", NAN);
+    const float cardAdd = tune("card_add", NAN);
+    const float cardSat = tune("card_sat", NAN);
+    const float lightGain = tune("light_card_gain", NAN);
+    const float lightAdd = tune("light_card_add", NAN);
+    const float lightSat = tune("light_card_sat", NAN);
+    const float layer0 = tune("light_card_layer0_a", NAN);
+    const float layer1 = tune("light_card_layer1_a", NAN);
+
+    table.plain = MaterialRecipe{};
+    table.plain.gain = std::isfinite(cosGain) ? cosGain : 1.0f;
+    table.plain.add = std::isfinite(cosAdd) ? cosAdd : 0.0f;
+    table.plain.sat = std::isfinite(cosSat) ? cosSat : 1.0f;
+    table.plain.rim = cosRim;
+    table.plain.glow = cosGlow;
+    table.plain.rimPx = rimPx;
+
+    for (int32_t material = 1; material < 15; material++) {
+        if (!tunedGlassMaterial(material)) continue;
+        if (material == 7) {
+            table.glass[material] = resolveGlassRecipe(material, cardGain, cardAdd, cardSat,
+                                                       cosRim, cosGlow, rimPx);
+        } else if (material == 8) {
+            table.glass[material] = resolveGlassRecipe(material, lightGain, lightAdd, lightSat,
+                                                       cosRim, cosGlow, rimPx);
+            if (std::isfinite(layer0)) {
+                table.glass[material].layer0Alpha = std::clamp(layer0, 0.0f, 1.0f);
+            }
+            if (std::isfinite(layer1)) {
+                table.glass[material].layer1Alpha = std::clamp(layer1, 0.0f, 1.0f);
+            }
+        } else {
+            table.glass[material] = resolveGlassRecipe(material, cosGain, cosAdd, cosSat, cosRim,
+                                                       cosGlow, rimPx);
+        }
+    }
+}
+
+// The material's resolved recipe. Drawing runs per region, so the properties are read at most once
+// per 500 ms, not per draw. Without Liquid Glass every material keeps the cos_* props alone.
+static MaterialRecipe materialRecipe(int32_t material, bool liquidGlass) {
+    static std::mutex lock;
+    static GlassTunables table;
+    static bool loaded = false;
+    static std::chrono::steady_clock::time_point refreshed;
+    std::lock_guard<std::mutex> guard(lock);
+    const auto now = std::chrono::steady_clock::now();
+    if (!loaded || now - refreshed >= std::chrono::milliseconds(500)) {
+        refreshGlassTunables(table);
+        loaded = true;
+        refreshed = now;
+    }
+    return liquidGlass && tunedGlassMaterial(material) ? table.glass[material] : table.plain;
+}
+
 void BlurFilter::setDisplay(const std::string& namePlusId) {
     mLiquidGlass = mLiquidGlassEffect != nullptr && liquidGlassEnabledFor(namePlusId);
 }
@@ -500,12 +669,18 @@ static const CosGlassLayers& cosGlassLayers(int32_t material) {
     static const CosGlassLayers lightHeadsUp{SkV4{5, 3, 0, 0},
                                              {argb(0x80BFBFBF), argb(0xCC333333), argb(0),
                                               argb(0)}};
+    // The dialogs have no colour layers, only the lift.
+    static const CosGlassLayers dialog{SkV4{0, 0, 0, 0},
+                                       {argb(0), argb(0), argb(0), argb(0)}};
     // Explicit opt-in dock material. Keep the regular COS materials and shade unchanged.
     static const CosGlassLayers dock{SkV4{6, 0, 0, 0},
                                      {argb(0xFFD4D4D4), argb(0), argb(0), argb(0)}};
     switch (material) {
         case 11:
             return dock;
+        case 13:
+        case 14:
+            return dialog;
         case 2:
             return active;
         case 7:
@@ -558,7 +733,9 @@ static const CosRimTemplate& cosRimTemplate(int32_t material) {
             return lightHeadsUp;
         case 3:
         case 8:
+        case 14:
             return inactiveLight;
+        case 13:
         default:
             return inactiveDark;
     }
@@ -630,6 +807,12 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
     const auto blurShader = blurredImage->makeShader(SkTileMode::kMirror, SkTileMode::kMirror,
                                                      linearSampling, &blurMatrix);
 
+    // The dialogs' own glass needs Liquid Glass; without it they are the cards.
+    if (!mLiquidGlass) {
+        if (material == 13) material = 7;
+        if (material == 14) material = 8;
+    }
+
     bool windowGlass = false;
     if (material == 0 && mLiquidGlass && mCosGlassEffect != nullptr && cosGlassStyle() &&
         (panelTint || !effectRegion.isRect())) {
@@ -673,47 +856,34 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
         SkRuntimeShaderBuilder glass(mCosGlassEffect);
         glass.child("blurredInput") = blurShader;
         const CosGlassLayers& layers = cosGlassLayers(material);
-        // With Liquid Glass, the light card (notifications, dialogs) is a bright, colourful frost:
-        // the lift below lightens and saturates the colours behind it in place of the grey layers.
-        const bool lightCardLift = material == 8 && mLiquidGlass;
-        SkV4 color0 = layers.colors[0];
-        SkV4 color1 = layers.colors[1];
-        if (lightCardLift) {
-            // The pull toward a dark grey's luminance, which greys the backdrop. Off by default;
-            // the plain light card uses 0.098.
-            color0.w = std::clamp(tune("light_card_layer0_a", 0.0f), 0.0f, 1.0f);
-            // The grey colour dodge, which brightens by scaling and so clips bright colours to
-            // white. Off by default, the lift's white taking its place; the plain card uses 0.302.
-            color1.w = std::clamp(tune("light_card_layer1_a", 0.0f), 0.0f, 1.0f);
+        const MaterialRecipe recipe = materialRecipe(material, mLiquidGlass);
+        SkV4 colors[4] = {layers.colors[0], layers.colors[1], layers.colors[2], layers.colors[3]};
+        for (SkV4& color : colors) color.w *= recipe.layerScale;
+        // The light card's grey luminance pull greys the backdrop and its grey colour dodge clips
+        // bright colours to white, so both stay off unless their own properties set an alpha.
+        if (material == 8 && mLiquidGlass) {
+            if (std::isfinite(recipe.layer0Alpha)) colors[0].w = recipe.layer0Alpha;
+            if (std::isfinite(recipe.layer1Alpha)) colors[1].w = recipe.layer1Alpha;
         }
         glass.uniform("modes") = layers.modes;
-        glass.uniform("color0") = color0;
-        glass.uniform("color1") = color1;
-        glass.uniform("color2") = layers.colors[2];
-        glass.uniform("color3") = layers.colors[3];
-        // With Liquid Glass, the dark notification card is a denser, more colourful frost than
-        // the other COS glass, as iOS draws its notifications, so white text stays readable
-        // over a bright wallpaper.
+        glass.uniform("color0") = colors[0];
+        glass.uniform("color1") = colors[1];
+        glass.uniform("color2") = colors[2];
+        glass.uniform("color3") = colors[3];
+        // Under Liquid Glass each material's lift (rgb * gain + add, then saturation around the
+        // luminance) shapes its frost: the dark card is denser and more colourful so white text
+        // stays readable over a bright wallpaper, the light ones lay white over the backdrop and
+        // bring its colour back out from under it.
         glass.uniform("lift") = material == 11 ? SkV4{1.0f, 0.0f, 1.0f, 0.0f}
-                : material == 7 && mLiquidGlass
-                ? SkV4{tune("card_gain", 0.6f), tune("card_add", 0.0f), tune("card_sat", 1.5f),
-                       0.0f}
-                // The light card: rgb * gain + add, then saturation around the luminance. As the
-                // luminance weights sum to 1 the order doesn't matter: 0.7 and 0.3 lay 30% white
-                // over the backdrop, and 1.5 brings its colour back out from under it.
-                : lightCardLift
-                ? SkV4{tune("light_card_gain", 0.7f), tune("light_card_add", 0.3f),
-                       tune("light_card_sat", 1.5f), 0.0f}
-                : SkV4{tune("cos_gain", 1.0f), tune("cos_add", 0.0f),
-                       tune("cos_sat", 1.0f), 0.0f};
+                                               : SkV4{recipe.gain, recipe.add, recipe.sat, 0.0f};
         const SkRect& rect = effectRegion.rect();
         const float corner = effectRegion.radii(SkRRect::kUpperLeft_Corner).fX;
         float edge[16] = {};
         float glow[9] = {};
-        if ((material >= 1 && material <= 4) || (material >= 7 && material <= 10)) {
+        if (glassHasRim(material)) {
             const CosRimTemplate& rim = cosRimTemplate(material);
-            const float px = tune("cos_rim_px", 0.875f);
-            const float strength = tune("cos_rim", 1.0f);
+            const float px = recipe.rimPx;
+            const float strength = recipe.rim;
             const float edgeValues[16] = {1, 1, 1,
                                           rim.nearWidth * px, rim.nearWidth * px * 2,
                                           rim.farWidth * px, rim.farWidth * px * 2,
@@ -722,7 +892,7 @@ void BlurFilter::drawBlurRegion(SkCanvas* canvas, const SkRRect& effectRegion,
                                           cosRimRatio(rect.width(), rect.height(), corner), 10,
                                           0.5f};
             std::copy(std::begin(edgeValues), std::end(edgeValues), edge);
-            const float glowValues[9] = {rim.glowAlpha * tune("cos_glow", 1.0f), 0, 40 * px, 0,
+            const float glowValues[9] = {rim.glowAlpha * recipe.glow, 0, 40 * px, 0,
                                          rim.glowOffset * px, 1.3f, 1.3f, 20, 0.5f};
             std::copy(std::begin(glowValues), std::end(glowValues), glow);
         }
